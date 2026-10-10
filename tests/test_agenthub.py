@@ -34,7 +34,7 @@ class AgentHubV23Tests(unittest.TestCase):
         self.config = self.root / "project.json"
         self.worktrees = self.root / "worktrees"
         self.config.write_text(json.dumps({
-            "schema_version": 1, "agenthub_version": "2.3.1", "project_id": "test",
+            "schema_version": 1, "agenthub_version": "2.3.2", "project_id": "test",
             "devices": {"authority": {}, "client_primary": {}, "client_secondary": {}},
             "agents": {
                 "admin_agent": {"roles": ["administrator", "decider"], "devices": ["client_primary", "client_secondary"]},
@@ -199,6 +199,7 @@ class AgentHubV23Tests(unittest.TestCase):
         progress = json.dumps({"summary": "safe point", "next_step": "continue", "evidence": []})
         with self.assertRaises(hub.HubError):
             self.call("--device", "client_secondary", "checkpoint", "worker_a", "T-1", "--progress", progress)
+        self.call("--device", "authority", "checkpoint", "worker_a", "T-1", "--progress", progress)
         self.call("--device", "authority", "handoff", "worker_a", "T-1", "--to-device", "client_secondary", "--note", "move")
         self.call("--device", "client_secondary", "checkpoint", "worker_a", "T-1", "--progress", progress)
 

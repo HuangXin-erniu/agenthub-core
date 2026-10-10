@@ -22,6 +22,8 @@ RULES = {
 }
 EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 ALLOWED_EMAIL_DOMAINS = {"example.invalid", "example.com", "users.noreply.github.com"}
+# GitHub signs server-created merge commits with this public service identity.
+ALLOWED_EMAILS = {"noreply@github.com"}
 
 
 def load_manifest(content: bytes) -> set[str]:
@@ -54,7 +56,7 @@ def scan_content(name: str, content: bytes) -> list[str]:
                 findings.append(f"{rule}:{name}:{line_no}")
         for match in EMAIL.finditer(line):
             domain = match.group().rsplit("@", 1)[-1].casefold()
-            if domain not in ALLOWED_EMAIL_DOMAINS:
+            if domain not in ALLOWED_EMAIL_DOMAINS and match.group().casefold() not in ALLOWED_EMAILS:
                 findings.append(f"private-email:{name}:{line_no}")
     return findings
 

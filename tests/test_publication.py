@@ -42,7 +42,7 @@ class PublicationTests(unittest.TestCase):
             project.mkdir(parents=True)
             for name in ("AGENTS.md", "README.md"):
                 (project / name).write_text("private adapter")
-            config = {"schema_version": 1, "agenthub_version": "2.3.1", "project_id": "audit_project",
+            config = {"schema_version": 1, "agenthub_version": "2.3.2", "project_id": "audit_project",
                       "devices": {"windows": {}},
                       "agents": {"administrator": {"roles": ["administrator"], "devices": ["windows"]}},
                       "state_authority": {"host": "windows", "database": str(root / "private-state.db"), "policy": "single_authority_local"},
@@ -75,6 +75,9 @@ class PublicationTests(unittest.TestCase):
         findings = release.scan_content("fixture.txt", personal.encode())
         self.assertEqual(findings, ["private-email:fixture.txt:1"])
         self.assertEqual(release.scan_content("fixture.txt", b"agenthub@example.invalid"), [])
+        self.assertEqual(release.scan_content("fixture.txt", b"noreply@github.com"), [])
+        private_github = "person" + "@" + "github.com"
+        self.assertEqual(release.scan_content("fixture.txt", private_github.encode()), ["private-email:fixture.txt:1"])
         private_path = "C:" + "\\" + "Users" + "\\" + "person"
         self.assertEqual(release.scan_content("fixture.txt", private_path.encode()), ["private-user-path:fixture.txt:1"])
 

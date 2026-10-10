@@ -1,4 +1,6 @@
-# AgentHub Core 2.3.1
+# AgentHub Core 2.3.2
+
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 AgentHub is a lightweight, decision-first control plane for AI-agent collaboration across independent projects. Deciders publish compact, immutable task contracts; executors work in isolated Git worktrees and return commits, validation evidence or explicit blockers.
 
@@ -55,7 +57,7 @@ python agent_hub.py --project <project_id> --device <device_id> context <decider
 python agent_hub.py --project <project_id> --device <device_id> next <executor_agent_id>
 ```
 
-For a local authority with an explicit private configuration, use `--local --config <config_file>`. Always declare the executing device. The runtime retains its 2.3.1 CLI and configuration interfaces.
+For a local authority with an explicit private configuration, use `--local --config <config_file>`. Always declare the executing device. Version 2.3.2 retains the 2.3.1 CLI parameters and configuration format.
 
 | Commands | Purpose |
 | --- | --- |
@@ -64,7 +66,16 @@ For a local authority with an explicit private configuration, use `--local --con
 | checkpoint, handoff, submit | Save progress, transfer active device and submit evidence |
 | review, close, cancel, supersede | Review, verify integration or preserve a cancellation/replacement |
 
-Each subcommand supports `--help`. JSON arguments accept inline JSON or `@<file>` through `--spec`, `--progress` and `--result`. Task contracts bind assignee, decision key, full base commit, allowed/forbidden paths, acceptance, validation, deliverables and evidence requirements. Contracts using `task_naming` also require the configured chain ID and exact next sequence. Packets are limited to 16,384 UTF-8 bytes.
+Each subcommand supports `--help`. JSON arguments accept inline JSON or `@<file>` through `--spec`, `--progress` and `--result`. Task contracts bind assignee, decision key, base commit, allowed/forbidden paths, acceptance, validation, deliverables and evidence requirements. Contracts using `task_naming` also require the configured chain ID and exact next sequence. Packets are limited to 16,384 UTF-8 bytes.
+
+## Workflow integrity and routing
+
+- **Contracts:** `post` and `supersede` apply the same required fields, array, priority, budget, naming, decision and commit checks. Sequence numbers are global within a project, include cancelled tasks and cannot be reused. A replacement can retain its old task's chain ID, but cannot conflict with another active task. Replacement and cancellation commit atomically.
+- **Routing:** with remote access enabled, a registered device other than `state_authority.host` proxies through SSH on Windows and POSIX alike. The Authority, disabled remote access and explicit `--local` use local execution. SSH errors do not fall back to a local database.
+- **Handoff:** the current executor must save a checkpoint on the active device after the most recent claim or handoff. A different administrator can recover an unavailable device through the existing handoff command with a non-empty explanation; recovery records whether a valid checkpoint was missing. Event IDs determine order, including events occurring in the same second.
+- **Paths:** submission checks every changed path; a rename checks both source and destination. Forbidden patterns take precedence. NUL-separated Git output preserves Unicode, spaces and supported special filenames; paths that cannot be decoded reliably as UTF-8 are rejected. Existing `fnmatch` semantics remain: `src/*` also matches `src/nested/file.py`, and case normalization follows the host OS.
+
+These checks govern trusted workflow and committed changes. They do not sandbox running agents or prevent filesystem reads.
 
 ## Verification and deployment
 
@@ -82,9 +93,19 @@ python scripts/deploy_project.py --project <project_id>
 python scripts/smoke_project.py --config <config_file> --runtime agent_hub.py
 ```
 
-Deployment verifies file hashes and replaces individual files; it is not a transaction across all files. Back up authority state separately and avoid `--reset-state` unless intentionally rebuilding it. The smoke script clones the configured repository into a temporary directory and uses separate state and worktrees; it never runs the private launcher or deploys files. It tests generic lifecycle with synthetic task IDs, while unit tests cover naming rules. Unit tests create their own disposable repositories and require no SSH or private registrations.
+Deployment verifies file hashes and replaces individual files; it is not a transaction across all files. Back up authority state separately and avoid `--reset-state` unless intentionally rebuilding it. The smoke script clones the configured repository into a temporary directory and uses separate state and worktrees; it never runs the private launcher or deploys files. It tests generic lifecycle with synthetic task IDs, while unit tests cover naming rules. Unit tests create disposable repositories and require no SSH or private registrations.
 
-Messaging transports are disabled. The legacy Feishu/Lark implementations are omitted. Agent identities and role checks organize trusted workflow; they do not provide OS sandboxing or authenticate untrusted network users.
+Messaging transports are disabled. Legacy Feishu/Lark implementations are omitted. Agent identities and role checks organize trusted workflow; they do not authenticate untrusted network users.
+
+## Upgrade from 2.3.1
+
+1. Pause Authority commands and back up its SQLite state using an SQLite-aware backup or a stopped Authority. Keep the previous runtime available for rollback under your change process.
+2. Review the [changelog](CHANGELOG.md), install the 2.3.2 runtime and update your private configuration's `agenthub_version` to `2.3.2` so the structural audit agrees with the runtime.
+3. Configuration schema remains **1** and database schema remains **4**. Existing task and checkpoint history is preserved; no new database columns or destructive migration are introduced.
+4. Save a current checkpoint before ordinary handoff. Previously accepted incomplete replacement contracts, repeated sequences and renames involving forbidden paths are now rejected. Historical contracts are not rewritten.
+5. Run the structural audit, tests and isolated smoke check; validate the real launcher under your deployment process before resuming tasks.
+
+This public release does not deploy or modify any existing private project automatically.
 
 ## Contributing and license
 

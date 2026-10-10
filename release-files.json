@@ -4,9 +4,11 @@
   ".github/workflows/ci.yml",
   ".gitignore",
   "AGENTS.md",
+  "CHANGELOG.md",
   "CONTRIBUTING.md",
   "LICENSE",
   "README.md",
+  "README.zh-CN.md",
   "SECURITY.md",
   "agent_hub.py",
   "docs/CONTROL_PLANE_OPERATING_STANDARD.md",
@@ -21,5 +23,6 @@
   "templates/agenthub.windows.cmd.tmpl",
   "templates/project.example.json",
   "tests/test_agenthub.py",
+  "tests/test_integrity.py",
   "tests/test_publication.py"
 ]

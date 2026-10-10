@@ -7,7 +7,8 @@ Keep this repository project-neutral. Do not submit private registrations, busin
 3. Add behavioral tests for lifecycle, permissions, isolation or deployment changes.
 4. Run `python -m unittest discover -s tests -v` and `python scripts/audit_agenthub.py`.
 5. Review staged filenames and run `python scripts/check_release.py --staged` before committing. Run `python scripts/check_release.py --history` before pushing.
-6. Explain the resulting behavior and validation in the pull request.
+6. Keep English and Simplified Chinese READMEs aligned, including language links, commands and version information.
+7. Explain the resulting behavior and validation in the pull request.
 
 `release-files.json` is the exact public file allowlist. Update it deliberately when adding reusable source, documentation or tests; the scanner rejects unknown published paths, binary content and detected secrets. Avoid broad exclusions or disabling scanners to publish sensitive content. Git ignore rules are a convenience, not the release boundary.
 
