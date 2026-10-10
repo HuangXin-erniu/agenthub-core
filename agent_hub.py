@@ -27,7 +27,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 MAX_PACKET_BYTES = 16_384
 ROOT = Path(__file__).resolve().parent
 COMMANDS = {"init", "status", "context", "next", "show", "post", "claim", "handoff", "checkpoint", "submit", "review", "close", "decision", "audit", "rpc", "cancel", "supersede"}
@@ -363,6 +363,22 @@ def git(config: dict[str, Any], *args: str, cwd: str | None = None, check: bool 
     return result.stdout.strip()
 
 
+def changed_paths(config: dict[str, Any], base: str, commit: str, cwd: str) -> list[str]:
+    result = subprocess.run(
+        ["git", "-C", cwd, "diff", "--no-renames", "--name-only", "-z", f"{base}..{commit}"],
+        capture_output=True, check=False,
+    )
+    if result.returncode:
+        raise HubError("无法读取提交路径差异")
+    try:
+        raw = result.stdout.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise HubError("提交包含无法可靠解码为 UTF-8 的路径") from exc
+    if raw and not raw.endswith("\0"):
+        raise HubError("Git 路径差异缺少 NUL 分隔符")
+    return raw[:-1].split("\0") if raw else []
+
+
 def git_ok(config: dict[str, Any], *args: str, cwd: str | None = None) -> bool:
     repository = cwd or config.get("execution", {}).get("repository")
     return subprocess.run(
@@ -529,11 +545,18 @@ def do_show(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device
     }, ensure_ascii=False, indent=2))
 
 
-def do_post(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, raw: str) -> None:
-    identity(config, agent, device, "post")
+TASK_LIST_FIELDS = (
+    "instructions", "scope", "constraints", "allowed_paths", "forbidden_paths",
+    "acceptance", "validation", "deliverables", "evidence_requirements",
+)
+
+
+def validate_task_contract(config: dict[str, Any], raw: str) -> dict[str, Any]:
     spec = read_json_argument(raw, "任务包")
     task_id = required_text(spec, "id", 120)
     chain_id = spec.get("chain_id", "")
+    if not isinstance(chain_id, str):
+        raise HubError("chain_id 必须是字符串")
     title = required_text(spec, "title", 200)
     objective = required_text(spec, "objective")
     assignee = required_text(spec, "assignee", 80)
@@ -553,10 +576,10 @@ def do_post(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device
     evidence_requirements = required_list(spec, "evidence_requirements")
     blocked_protocol = required_text(spec, "blocked_protocol", 1000)
     priority = spec.get("priority", 50)
-    if not isinstance(priority, int) or not 1 <= priority <= 99:
+    if type(priority) is not int or not 1 <= priority <= 99:
         raise HubError("priority 必须是 1..99 的整数")
     context_budget = spec.get("context_budget", 6000)
-    if not isinstance(context_budget, int) or not 2000 <= context_budget <= 12000:
+    if type(context_budget) is not int or not 2000 <= context_budget <= 12000:
         raise HubError("context_budget 必须是 2000..12000 的整数")
     if len(json_dump(spec).encode("utf-8")) > context_budget:
         raise HubError("任务合同超过 context_budget；请压缩描述并只保留必要执行信息")
@@ -595,45 +618,78 @@ def do_post(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device
     if not worktree_root:
         raise HubError("项目未配置 execution.worktree_root")
     worktree_path = str(Path(worktree_root) / task_id)
-    stamp = now()
+    return {
+        **spec, "id": task_id, "chain_id": chain_id, "title": title, "objective": objective,
+        "assignee": assignee, "decision_key": decision_key, "base_commit": base_commit,
+        "instructions": instructions, "scope": scope, "constraints": constraints,
+        "allowed_paths": allowed_paths, "forbidden_paths": forbidden_paths,
+        "acceptance": acceptance, "validation": validation, "deliverables": deliverables,
+        "evidence_requirements": evidence_requirements, "blocked_protocol": blocked_protocol,
+        "priority": priority, "context_budget": context_budget,
+        "branch": branch, "worktree_path": worktree_path,
+    }
+
+
+def check_task_constraints(conn: sqlite3.Connection, config: dict[str, Any], spec: dict[str, Any], replacing: str | None = None) -> None:
+    task_id, chain_id = spec["id"], spec["chain_id"]
+    if conn.execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone():
+        raise HubError(f"任务 ID 已存在: {task_id}")
+    naming = config.get("task_naming", {})
+    if naming:
+        conflict = conn.execute(
+            "SELECT 1 FROM tasks WHERE chain_id=? AND status NOT IN ('closed','cancelled') AND task_id != ?",
+            (chain_id, replacing or ""),
+        ).fetchone()
+        if conflict:
+            raise HubError(f"active chain_id 已存在: {chain_id}")
+        candidate = int(re.fullmatch(naming["task_pattern"], task_id).group("seq"))
+        existing_seqs = set()
+        for row in conn.execute("SELECT task_id FROM tasks"):
+            match = re.fullmatch(naming["task_pattern"], row["task_id"])
+            if match:
+                existing_seqs.add(int(match.group("seq")))
+        if candidate in existing_seqs:
+            raise HubError(f"序号 {candidate:0{naming['seq_digits']}d} 已被占用（含已取消任务）")
+        expected = max(existing_seqs) + 1 if existing_seqs else 1
+        if candidate != expected:
+            raise HubError(f"下一可用序号应为 {expected:0{naming['seq_digits']}d}，但收到 {candidate:0{naming['seq_digits']}d}")
+    if not conn.execute("SELECT 1 FROM decisions WHERE decision_key=?", (spec["decision_key"],)).fetchone():
+        raise HubError(f"任务必须关联已存在的决策: {spec['decision_key']}")
+    git(config, "rev-parse", "--verify", f"{spec['base_commit']}^{{commit}}")
+
+
+def insert_task(conn: sqlite3.Connection, config: dict[str, Any], agent: str, spec: dict[str, Any], stamp: str, supersedes: str | None = None) -> None:
+    check_task_constraints(conn, config, spec, replacing=supersedes)
+    values = {
+        "task_id": spec["id"], "title": spec["title"], "objective": spec["objective"],
+        "priority": spec["priority"], "assignee": spec["assignee"],
+        "decision_key": spec["decision_key"], "base_commit": spec["base_commit"],
+        "branch": spec["branch"], "worktree_path": spec["worktree_path"],
+        "blocked_protocol": spec["blocked_protocol"], "context_budget": spec["context_budget"],
+        "status": "ready", "created_by": agent, "created_at": stamp, "updated_at": stamp,
+        "chain_id": spec["chain_id"], "supersedes": supersedes,
+    }
+    values.update({field + "_json": json_dump(spec[field]) for field in TASK_LIST_FIELDS})
+    columns = ",".join(values)
+    placeholders = ",".join("?" for _ in values)
+    conn.execute(f"INSERT INTO tasks({columns}) VALUES({placeholders})", tuple(values.values()))
+
+
+def do_post(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, raw: str) -> None:
+    identity(config, agent, device, "post")
+    spec = validate_task_contract(config, raw)
     conn.execute("BEGIN IMMEDIATE")
     try:
-        if naming:
-            dup = conn.execute("SELECT 1 FROM tasks WHERE task_id=? OR (chain_id=? AND chain_id IS NOT NULL AND chain_id!='' AND status NOT IN ('closed','cancelled'))", (task_id, chain_id)).fetchone()
-            if dup:
-                raise HubError(f"task_id 或 active chain_id 已存在: {task_id} / {chain_id}")
-            seq_match = re.match(naming["task_pattern"], task_id)
-            if seq_match:
-                candidate = int(seq_match.group("seq"))
-                used = conn.execute("SELECT task_id FROM tasks").fetchall()
-                existing_seqs = set()
-                for row in used:
-                    m = re.match(naming["task_pattern"], row["task_id"])
-                    if m:
-                        existing_seqs.add(int(m.group("seq")))
-                if candidate in existing_seqs:
-                    raise HubError(f"序号 {candidate:0{naming['seq_digits']}d} 已被占用（含已取消任务）")
-                expected = (max(existing_seqs) + 1) if existing_seqs else 1
-                if candidate != expected:
-                    raise HubError(f"下一可用序号应为 {expected:0{naming['seq_digits']}d}，但收到 {candidate:0{naming['seq_digits']}d}")
-        if not conn.execute("SELECT 1 FROM decisions WHERE decision_key=?", (decision_key,)).fetchone():
-            raise HubError(f"任务必须关联已存在的决策: {decision_key}")
-        git(config, "rev-parse", "--verify", f"{base_commit}^{{commit}}")
-        conn.execute(
-            "INSERT INTO tasks(task_id,title,objective,instructions_json,acceptance_json,priority,assignee,decision_key,base_commit,branch,worktree_path,scope_json,constraints_json,allowed_paths_json,forbidden_paths_json,validation_json,deliverables_json,evidence_requirements_json,blocked_protocol,context_budget,status,created_by,created_at,updated_at,chain_id) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (task_id, title, objective, json_dump(instructions), json_dump(acceptance), priority,
-             assignee, decision_key, base_commit, branch, worktree_path, json_dump(scope),
-             json_dump(constraints), json_dump(allowed_paths), json_dump(forbidden_paths),
-             json_dump(validation), json_dump(deliverables), json_dump(evidence_requirements),
-             blocked_protocol, context_budget, "ready", agent, stamp, stamp, chain_id),
-        )
-        record(conn, agent, device, "task.post", task_id, {"title": title, "priority": priority, "assignee": assignee, "decision_key": decision_key, "base_commit": base_commit})
+        insert_task(conn, config, agent, spec, now())
+        record(conn, agent, device, "task.post", spec["id"], {
+            key: spec[key] for key in ("title", "priority", "assignee", "decision_key", "base_commit")
+        })
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-    print(f"已发布 {task_id}")
+    print(f"已发布 {spec['id']}")
+
 
 def load_task(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
@@ -683,30 +739,52 @@ def do_claim(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devic
     print(json.dumps(task_packet(conn, load_task(conn, task_id), config), ensure_ascii=False, indent=2))
 
 
+def fresh_checkpoint_event(conn: sqlite3.Connection, task_id: str, executor: str, device: str) -> sqlite3.Row | None:
+    boundary = conn.execute(
+        "SELECT event_id FROM events WHERE entity_id=? AND action IN ('task.claim','task.handoff','task.handoff.force') ORDER BY event_id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    checkpoint = conn.execute(
+        "SELECT event_id,detail_json FROM events WHERE entity_id=? AND action='task.checkpoint' AND agent_id=? AND device=? ORDER BY event_id DESC LIMIT 1",
+        (task_id, executor, device),
+    ).fetchone()
+    if not boundary or not checkpoint or checkpoint["event_id"] <= boundary["event_id"]:
+        return None
+    return checkpoint
+
+
 def do_handoff(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, task_id: str, to_device: str, note: str) -> None:
     info = identity(config, agent, device, "handoff")
-    row = load_task(conn, task_id)
-    if row["status"] != "in_progress" or not row["claimed_by"]:
-        raise HubError("只有 in_progress 任务可以进行设备交接")
-    executor = row["claimed_by"]
-    executor_info = config["agents"].get(executor, {})
-    if to_device not in executor_info.get("devices", []):
-        raise HubError(f"执行者 {executor} 不允许在设备 {to_device} 工作")
-    roles = set(info.get("roles", []))
-    forced = "administrator" in roles and agent != executor
-    if not forced:
-        if agent != executor:
-            raise HubError("只有当前执行者或管理员可以交接任务设备")
-        if row["active_device"] != device:
-            raise HubError(f"任务当前活动设备是 {row['active_device']}，必须从该设备发起交接")
     if not note.strip():
         raise HubError("设备交接说明不能为空")
     conn.execute("BEGIN IMMEDIATE")
-    conn.execute("UPDATE tasks SET active_device=?,updated_at=? WHERE task_id=?", (to_device, now(), task_id))
-    record(conn, agent, device, "task.handoff.force" if forced else "task.handoff", task_id, {
-        "from_device": row["active_device"], "to_device": to_device, "executor": executor, "note": note.strip(),
-    })
-    conn.commit()
+    try:
+        row = load_task(conn, task_id)
+        if row["status"] != "in_progress" or not row["claimed_by"]:
+            raise HubError("只有 in_progress 任务可以进行设备交接")
+        executor = row["claimed_by"]
+        executor_info = config["agents"].get(executor, {})
+        if to_device not in executor_info.get("devices", []):
+            raise HubError(f"执行者 {executor} 不允许在设备 {to_device} 工作")
+        forced = "administrator" in set(info.get("roles", [])) and agent != executor
+        if not forced:
+            if agent != executor:
+                raise HubError("只有当前执行者或管理员可以交接任务设备")
+            if row["active_device"] != device:
+                raise HubError(f"任务当前活动设备是 {row['active_device']}，必须从该设备发起交接")
+        checkpoint = fresh_checkpoint_event(conn, task_id, executor, row["active_device"])
+        if not forced and checkpoint is None:
+            raise HubError("设备交接前必须由当前执行者在当前活动设备保存本轮 checkpoint；请先执行 checkpoint")
+        conn.execute("UPDATE tasks SET active_device=?,updated_at=? WHERE task_id=?", (to_device, now(), task_id))
+        record(conn, agent, device, "task.handoff.force" if forced else "task.handoff", task_id, {
+            "from_device": row["active_device"], "to_device": to_device, "executor": executor,
+            "note": note.strip(), "checkpoint_missing": checkpoint is None,
+            "checkpoint_event_id": checkpoint["event_id"] if checkpoint else None,
+        })
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     print(f"已交接 {task_id}: {row['active_device']} -> {to_device}")
 
 
@@ -769,7 +847,7 @@ def do_submit(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devi
             raise HubError("worktree 仍有未提交变更；执行者必须先提交代码再申请复核")
         if not git_ok(config, "merge-base", "--is-ancestor", row["base_commit"], commit, cwd=worktree):
             raise HubError("提交 commit 不是任务 base_commit 的后代")
-        changed = git(config, "diff", "--name-only", f"{row['base_commit']}..{commit}", cwd=worktree).splitlines()
+        changed = changed_paths(config, row["base_commit"], commit, worktree)
         allowed = json.loads(row["allowed_paths_json"])
         forbidden = json.loads(row["forbidden_paths_json"])
         outside = [path for path in changed if not any(fnmatch.fnmatch(path, pattern) for pattern in allowed)]
@@ -867,67 +945,30 @@ def do_supersede(conn: sqlite3.Connection, config: dict[str, Any], agent: str, d
     identity(config, agent, device, "supersede")
     if not reason.strip():
         raise HubError("替代原因不能为空")
-    old_row = load_task(conn, task_id)
-    if old_row["status"] not in {"ready", "blocked", "review", "in_progress"}:
-        raise HubError(f"只有 ready/blocked/review/in_progress 状态可以被替代，当前状态: {old_row['status']}")
-    spec = read_json_argument(new_spec, "新任务包")
-    new_id = required_text(spec, "id", 120)
-    if old_row["superseded_by"]:
-        raise HubError(f"任务 {task_id} 已被 {old_row['superseded_by']} 替代")
-    dup = conn.execute("SELECT 1 FROM tasks WHERE task_id=?", (new_id,)).fetchone()
-    if dup:
-        raise HubError(f"新任务 ID 已存在: {new_id}")
-    new_title = required_text(spec, "title", 200)
-    new_objective = required_text(spec, "objective")
-    new_assignee = required_text(spec, "assignee", 80)
-    assignee_info = config["agents"].get(new_assignee, {})
-    if "executor" not in assignee_info.get("roles", []) or not assignee_info.get("enabled", True):
-        raise HubError(f"assignee 必须是启用的执行者: {new_assignee}")
-    new_decision_key = required_text(spec, "decision_key", 160)
-    if not conn.execute("SELECT 1 FROM decisions WHERE decision_key=?", (new_decision_key,)).fetchone():
-        raise HubError(f"任务必须关联已存在的决策: {new_decision_key}")
-    new_base_commit = required_text(spec, "base_commit", 80)
-    new_chain_id = spec.get("chain_id", "")
-    naming = config.get("task_naming", {})
-    if naming:
-        if not re.fullmatch(naming["task_pattern"], new_id):
-            raise HubError(f"新任务 id 不符合项目命名规则 {naming['task_pattern']}: {new_id}")
-        if not new_chain_id:
-            raise HubError("新任务必须指定 chain_id")
-        if not re.fullmatch(naming["chain_pattern"], new_chain_id):
-            raise HubError(f"新任务 chain_id 不符合项目命名规则 {naming['chain_pattern']}: {new_chain_id}")
+    spec = validate_task_contract(config, new_spec)
+    new_id = spec["id"]
     conn.execute("BEGIN IMMEDIATE")
     try:
-        git(config, "rev-parse", "--verify", f"{new_base_commit}^{{commit}}")
+        old_row = load_task(conn, task_id)
+        if old_row["status"] not in {"ready", "blocked", "review", "in_progress"}:
+            raise HubError(f"只有 ready/blocked/review/in_progress 状态可以被替代，当前状态: {old_row['status']}")
+        if old_row["superseded_by"]:
+            raise HubError(f"任务 {task_id} 已被 {old_row['superseded_by']} 替代")
         stamp = now()
-        new_branch = f"agenthub/{new_id}"
-        worktree_root = config.get("execution", {}).get("worktree_root")
-        if not worktree_root:
-            raise HubError("项目未配置 execution.worktree_root")
-        new_worktree_path = str(Path(worktree_root) / new_id)
-        conn.execute(
-            "INSERT INTO tasks(task_id,title,objective,instructions_json,acceptance_json,priority,assignee,decision_key,base_commit,branch,worktree_path,scope_json,constraints_json,allowed_paths_json,forbidden_paths_json,validation_json,deliverables_json,evidence_requirements_json,blocked_protocol,context_budget,status,created_by,created_at,updated_at,chain_id,supersedes) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (new_id, new_title, new_objective, json_dump(spec.get("instructions", [])), json_dump(spec.get("acceptance", [])),
-             spec.get("priority", 50), new_assignee, new_decision_key, new_base_commit, new_branch, new_worktree_path,
-             json_dump(spec.get("scope", [])), json_dump(spec.get("constraints", [])),
-             json_dump(spec.get("allowed_paths", [])), json_dump(spec.get("forbidden_paths", [])),
-             json_dump(spec.get("validation", [])), json_dump(spec.get("deliverables", [])),
-             json_dump(spec.get("evidence_requirements", [])), spec.get("blocked_protocol", ""),
-             spec.get("context_budget", 6000), "ready", agent, stamp, stamp, new_chain_id, task_id),
-        )
+        insert_task(conn, config, agent, spec, stamp, supersedes=task_id)
         record(conn, agent, device, "task.supersede.new_posted", task_id, {"new_task": new_id, "reason": reason.strip()})
         conn.execute(
             "UPDATE tasks SET status='cancelled',claimed_by=NULL,active_device=NULL,cancelled_at=?,cancelled_by=?,cancel_reason=?,superseded_by=?,updated_at=? WHERE task_id=?",
             (stamp, agent, f"superseded by {new_id}: {reason.strip()}", new_id, stamp, task_id),
         )
-        record(conn, agent, device, "task.supersede.old_cancelled", task_id, {"new_task": new_id, "reason": reason.strip(), "previous_status": old_row["status"]})
+        record(conn, agent, device, "task.supersede.old_cancelled", task_id, {
+            "new_task": new_id, "reason": reason.strip(), "previous_status": old_row["status"],
+        })
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     print(f"已替代 {task_id} -> {new_id}")
-
 
 
 def do_decision(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, key: str, summary: str, rationale: str) -> None:
@@ -1012,7 +1053,9 @@ def run(argv: list[str] | None = None) -> int:
         return run(forwarded)
     if not device:
         raise HubError("必须使用 --device 或 AGENTHUB_DEVICE 声明执行设备")
-    if not args.local and platform.system() != "Windows" and config.get("remote", {}).get("enabled"):
+    if device not in config["devices"]:
+        raise HubError(f"未知设备: {device}")
+    if not args.local and device != config["state_authority"]["host"] and config.get("remote", {}).get("enabled"):
         return proxy_to_authority(config, device, argv)
     state = Path(args.state or config["state_authority"]["database"])
     conn = connect(state)
