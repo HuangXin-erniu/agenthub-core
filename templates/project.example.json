@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "agenthub_version": "2.3.1",
+  "project_id": "<project_id>",
+  "project_name": "<project_name>",
+  "workflow": "decision_first",
+  "messaging_transports": [],
+  "lark_workflow": "hard_disabled",
+  "devices": {
+    "<authority_device_id>": {
+      "kind": "execution_host",
+      "project_access": "local"
+    },
+    "<client_device_id>": {
+      "kind": "client",
+      "project_access": "ssh_to_authority"
+    }
+  },
+  "agents": {
+    "<administrator_agent_id>": {
+      "enabled": true,
+      "roles": [
+        "administrator",
+        "decider"
+      ],
+      "devices": [
+        "<client_device_id>"
+      ]
+    },
+    "<executor_agent_id>": {
+      "enabled": true,
+      "roles": [
+        "executor"
+      ],
+      "devices": [
+        "<authority_device_id>",
+        "<client_device_id>"
+      ]
+    }
+  },
+  "state_authority": {
+    "host": "<authority_device_id>",
+    "database": "<authority-local-state-path>",
+    "policy": "single_authority_local"
+  },
+  "execution": {
+    "repository": "<authority-project-root>",
+    "worktree_root": "<authority-worktree-root>",
+    "concurrency": "one_active_task_per_executor",
+    "isolation": "git_worktree_per_task"
+  },
+  "remote": {
+    "enabled": true,
+    "shell": "<windows_cmd-or-posix_sh>",
+    "ssh_host": "<ssh-config-alias>",
+    "project_root": "<authority-project-root>",
+    "launcher": "<launcher-file>",
+    "ssh_options": [
+      "BatchMode=yes",
+      "StrictHostKeyChecking=yes",
+      "ConnectTimeout=10",
+      "ServerAliveInterval=15",
+      "ServerAliveCountMax=2"
+    ]
+  },
+  "instructions": {
+    "common": "AGENTS.md",
+    "<administrator_agent_id>": "<administrator-role-file>",
+    "<executor_agent_id>": "<executor-role-file>"
+  },
+  "deployment": {
+    "adapter": "<ssh_atomic_windows-or-ssh_atomic_posix>",
+    "managed_files": [
+      {
+        "source": "../../agent_hub.py",
+        "destination": "<runtime-destination>"
+      },
+      {
+        "source": "project.json",
+        "destination": "<config-destination>"
+      },
+      {
+        "source": "<launcher-file>",
+        "destination": "<launcher-file>"
+      },
+      {
+        "source": "AGENTS.md",
+        "destination": "AGENTS.md"
+      }
+    ]
+  },
+  "task_naming": {
+    "task_pattern": "(?P<phase>P\\d\\d)-(?P<domain>[A-Z]+)-(?P<type>[A-Z]+)-(?P<subject>[A-Z0-9]+)-(?P<seq>\\d{3})",
+    "chain_pattern": "CHN-(?P<seq>\\d{4})",
+    "seq_offset": 0,
+    "seq_digits": 3,
+    "enum_description": {
+      "PHASE": "P00-P10/P90/P99",
+      "DOMAIN": "GOV/TASK/DATA/MODEL/WEB/SEC/LIFE",
+      "TYPE": "FIX/AUDIT/FEAT/TRAIN/EVAL/DEPLOY"
+    },
+    "phase_domains": {
+      "P00": [
+        "GOV",
+        "TASK",
+        "SEC"
+      ],
+      "P99": [
+        "GOV",
+        "TASK",
+        "SEC"
+      ]
+    },
+    "domain_types": {
+      "GOV": [
+        "FIX",
+        "AUDIT"
+      ],
+      "TASK": [
+        "FIX",
+        "AUDIT",
+        "FEAT"
+      ],
+      "SEC": [
+        "FIX",
+        "AUDIT"
+      ],
+      "DATA": [
+        "FIX",
+        "AUDIT",
+        "FEAT"
+      ],
+      "MODEL": [
+        "FEAT",
+        "TRAIN",
+        "EVAL"
+      ],
+      "WEB": [
+        "DEPLOY",
+        "FEAT"
+      ],
+      "LIFE": [
+        "FIX",
+        "AUDIT",
+        "DEPLOY"
+      ]
+    }
+  }
+}

@@ -1,0 +1,12 @@
+@echo off
+setlocal
+if not defined AGENTHUB_AUTHORITY_ROOT set "AGENTHUB_AUTHORITY_ROOT=<authority-project-root>"
+set "ROOT=%AGENTHUB_AUTHORITY_ROOT%\"
+set "PYTHON=%ROOT%<python-relative-path>"
+set "CORE=%ROOT%<runtime-relative-path>"
+set "CONFIG=%ROOT%<config-relative-path>"
+set "STATE=%ROOT%<state-relative-path>"
+if not exist "%PYTHON%" (echo [AgentHub] Python not found: %PYTHON% 1>&2 & exit /b 2)
+if not exist "%CORE%" (echo [AgentHub] Runtime not deployed: %CORE% 1>&2 & exit /b 2)
+"%PYTHON%" "%CORE%" --local --config "%CONFIG%" --state "%STATE%" %*
+exit /b %ERRORLEVEL%

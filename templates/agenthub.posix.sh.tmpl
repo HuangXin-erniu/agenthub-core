@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+AUTHORITY_ROOT="${AGENTHUB_AUTHORITY_ROOT:-<authority-project-root>}"
+PYTHON="$AUTHORITY_ROOT/<python-relative-path>"
+CORE="$AUTHORITY_ROOT/<runtime-relative-path>"
+CONFIG="$AUTHORITY_ROOT/<config-relative-path>"
+STATE="$AUTHORITY_ROOT/<state-relative-path>"
+exec "$PYTHON" "$CORE" --local --config "$CONFIG" --state "$STATE" "$@"

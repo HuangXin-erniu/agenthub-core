@@ -1,0 +1,19 @@
+# AgentHub v2.3 control-plane rules
+
+This repository is a lightweight, multi-project AgentHub control plane. It must not contain business-code mirrors, production databases, datasets, models or project environments.
+
+At every new session:
+
+1. Obtain the target `project_id`; never infer it from the last chat.
+2. Read `projects/<project_id>/project.json` as the authority for Agent identities, roles, devices, execution host and paths.
+3. Read `projects/<project_id>/AGENTS.md` plus exactly one role instruction declared by `project.json.instructions`.
+4. Deciders start with `context`; executors start with `next`.
+5. Use only the current project's configured authority and worktree. Never reuse paths, state or contracts from another project.
+
+AgentHub core commands and role semantics are project-neutral. Project names, Agent IDs, device IDs, operating-system paths, SSH aliases and launchers belong only to project registrations/adapters.
+
+Deciders use `show` before handling blocked/review tasks. Executors modify only the assigned authority-host worktree and use checkpoint plus handoff before changing device. Messaging transports are disabled; legacy transport code is not part of this repository.
+
+Do not load full history or infer work from old chat. Ask the user before unclear, destructive, credential, network, merge/push or external-service actions.
+
+For core maintenance without a registered project, use an isolated checkout and disposable test configurations. Never create or infer a real registration merely to run tests. Public commits must contain only files declared in `release-files.json`; run the structural audit, behavioral tests and release scanner before publishing.
