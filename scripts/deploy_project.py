@@ -95,7 +95,7 @@ def is_local_windows_target(host: str) -> bool:
 def deploy_posix(host: str, root: str, staging: str, entries: list[dict[str, str | Path]], reset_state: bool, state: str) -> None:
     directories = sorted({str(Path(root) / Path(str(e["destination"])).parent) for e in entries})
     prepare = "set -eu; " + "; ".join(f"mkdir -p -- {shlex.quote(value)}" for value in [staging, *directories])
-    run(["ssh", host, "sh", "-lc", shlex.quote(prepare)])
+    run(["ssh", host, "sh", "-c", shlex.quote(prepare)])
     for entry in entries:
         run(["scp", str(entry["source"]), f"{host}:{staging}/{entry['stage']}"])
     commands = ["set -eu"]
@@ -110,7 +110,7 @@ def deploy_posix(host: str, root: str, staging: str, entries: list[dict[str, str
         for e in entries
     )
     commands.append(f"rmdir -- {shlex.quote(staging)}")
-    run(["ssh", host, "sh", "-lc", shlex.quote("; ".join(commands))])
+    run(["ssh", host, "sh", "-c", shlex.quote("; ".join(commands))])
 
 
 def main(argv: list[str] | None = None) -> int:
