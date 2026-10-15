@@ -35,7 +35,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-VERSION = "2.3.3"
+VERSION = "2.3.4"
 MAX_PACKET_BYTES = 16_384
 ROOT = Path(__file__).resolve().parent
 COMMANDS = {"init", "status", "context", "next", "show", "post", "claim", "handoff", "checkpoint", "submit", "review", "close", "decision", "audit", "rpc", "cancel", "supersede", "prune"}

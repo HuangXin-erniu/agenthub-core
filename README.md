@@ -1,4 +1,4 @@
-# AgentHub Core 2.3.3
+# AgentHub Core 2.3.4
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -57,7 +57,7 @@ python agent_hub.py --project <project_id> --device <device_id> context <decider
 python agent_hub.py --project <project_id> --device <device_id> next <executor_agent_id>
 ```
 
-For a local authority with an explicit private configuration, use `--local --config <config_file>`. Always declare the executing device. Version 2.3.3 retains the 2.3.1 CLI parameters and configuration format.
+For a local authority with an explicit private configuration, use `--local --config <config_file>`. Always declare the executing device. Version 2.3.4 retains the 2.3.1 CLI parameters and configuration format.
 
 | Commands | Purpose |
 | --- | --- |
@@ -90,17 +90,19 @@ The audit accepts an unregistered core checkout. Once private registrations exis
 ```sh
 python scripts/deploy_project.py --project <project_id> --dry-run
 python scripts/deploy_project.py --project <project_id>
+python scripts/deploy_project.py --project <project_id> --verify
+python scripts/deploy_project.py --project <project_id> --rollback
 python scripts/smoke_project.py --config <config_file> --runtime agent_hub.py
 ```
 
-Deployment verifies file hashes and replaces individual files; it is not a transaction across all files. Back up authority state separately and avoid `--reset-state` unless intentionally rebuilding it. The smoke script clones the configured repository into a temporary directory and uses separate state and worktrees; it never runs the private launcher or deploys files. It tests generic lifecycle with synthetic task IDs, while unit tests cover naming rules. Unit tests create disposable repositories and require no SSH or private registrations.
+Deployment replaces managed files one by one, so it is not a transaction across the file set. The ordering it does guarantee: every staged file is hash-verified before any file is replaced; the generation being replaced is retained; and after the swap the deployed runtime is made to load the deployed configuration, which is the only pair of managed files that constrain each other. If that self-check fails the previous generation is restored automatically, so an intermediate state either works or is undone. `--rollback` restores the retained generation on demand, and `--verify` compares the deployed files against the registration by hash. Authority state is never part of a deployment: back it up separately in an SQLite-aware way, and avoid `--reset-state` unless intentionally rebuilding it. The smoke script clones the configured repository into a temporary directory and uses separate state and worktrees; it never runs the private launcher or deploys files. It tests generic lifecycle with synthetic task IDs, while unit tests cover naming rules and `tests/test_upgrade.py` covers upgrading with a task in flight. Unit tests create disposable repositories and require no SSH or private registrations.
 
 Messaging transports are disabled. Legacy Feishu/Lark implementations are omitted. Agent identities and role checks organize trusted workflow; they do not authenticate untrusted network users.
 
 ## Upgrade from 2.3.1
 
-1. Pause Authority commands and back up its SQLite state using an SQLite-aware backup or a stopped Authority. Keep the previous runtime available for rollback under your change process.
-2. Review the [changelog](CHANGELOG.md), install the 2.3.3 runtime and update your private configuration's `agenthub_version` to `2.3.3` so the structural audit agrees with the runtime.
+1. Pause Authority commands and back up its SQLite state using an SQLite-aware backup or a stopped Authority. Nothing else needs to be kept aside for rollback: a deployment retains the generation it replaces, and `--rollback` restores it.
+2. Review the [changelog](CHANGELOG.md), install the 2.3.4 runtime and update your private configuration's `agenthub_version` to `2.3.4` so the structural audit agrees with the runtime.
 3. Configuration schema remains **1** and database schema remains **4**. Existing task and checkpoint history is preserved; no new database columns or destructive migration are introduced.
 4. Save a current checkpoint before ordinary handoff. Previously accepted incomplete replacement contracts, repeated sequences and renames involving forbidden paths are now rejected. Historical contracts are not rewritten.
 5. Run the structural audit, tests and isolated smoke check; validate the real launcher under your deployment process before resuming tasks.

@@ -1,4 +1,4 @@
-# AgentHub v2.3.3 project registration standard
+# AgentHub v2.3.4 project registration standard
 
 ## Boundary
 
@@ -30,6 +30,29 @@ No concrete value from one registration may appear in core source or another reg
 9. Run structural audit and unit tests.
 10. Deploy with `python3 scripts/deploy_project.py --project <project_id>` without resetting state.
 11. Run the authority-host smoke test before production tasks. It uses a temporary clone, state and worktree and does not invoke the private launcher. Validate the actual launcher separately under your change process.
+
+## Upgrading an existing registration
+
+A deployment replaces the managed files on the authority. It never touches the state database, and a task that is in flight continues across it — that is asserted by `tests/test_upgrade.py`, which claims a task with the previous release's runtime and finishes it with the checked-out one.
+
+```bash
+python3 scripts/deploy_project.py --project <project_id> --dry-run     # sources, hashes, in-flight tasks
+python3 scripts/deploy_project.py --project <project_id>              # deploy
+python3 scripts/deploy_project.py --project <project_id> --verify     # registry vs deployed, by hash
+```
+
+Order of operations when upgrading:
+
+1. Back the state database up in an SQLite-aware way (its `-wal` and `-shm` companions included), or stop the authority. A deployment does not do this for you.
+2. Bump `agenthub_version` in the private `project.json` to the new version. The structural audit requires the registration and the runtime to agree, so a partial upgrade fails loudly rather than silently.
+3. `--dry-run`. It reports the in-flight tasks as well as the files; add `--require-idle` to the deployment if you want it to refuse while any task is unfinished. In-flight tasks are safe by measurement, so the default is to report and proceed.
+4. Deploy. Every staged file is hash-verified before any file is replaced; the generation being replaced is retained; and after the swap the deployed runtime is made to load the deployed configuration. If that check fails, the previous generation is restored automatically and the staging directory is left for inspection.
+5. `--verify` to confirm the deployed files match the registry.
+6. If the new version turns out to be wrong, `python3 scripts/deploy_project.py --project <project_id> --rollback` restores the retained generation and re-runs the self-check. One generation is retained, so this undoes the most recent deployment; restore state from your own backup if the change involved it.
+
+What is guaranteed across versions, and what is checked: configuration schema 1 and database schema 4 stay compatible, and schema changes are additive only. `tests/test_upgrade.py` asserts that the previous release's runtime can still read state written by the current one, so a release that needs to break that has to say so explicitly.
+
+The `windows_cmd` adapter implements the same ordering and the same self-check, but only its generated scripts are tested here; it has not been exercised against a real Windows authority.
 
 ## Fictional example
 

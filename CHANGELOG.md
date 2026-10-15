@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.3.4 — 2026-10-15
+
+### Fixed
+
+- A deployment could land the launcher non-executable and take the authority down with it. The launcher is invoked as `./.agenthub/agenthub.sh`, its mode after a deploy is the source mode masked by the remote umask, and nothing in the repository called `chmod`. The registration's launcher is a local, Git-ignored file — it has no recorded mode — while the only tracked launcher artifact, `templates/agenthub.posix.sh.tmpl`, is `100644`; so rebuilding a registration from the template without an explicit `chmod +x` produced a deployment that broke every proxied command. The staged launcher is now made executable before it is moved, so it lands correct and there is no window.
+- The POSIX adapter never cleared its staging directory, unlike the Windows one. A file left by a crashed run is truncated in place by `scp`, which does not reset an existing file's mode, and the following `mv` would carry that stale mode into place.
+- A hash mismatch surfaced only as a `CalledProcessError` traceback. The check now names the offending file, and a failed activation reports what the authority said instead of a traceback.
+
+### Added
+
+- The generation being replaced is retained under `staging-v23-previous`, and `--rollback` restores it: a documented manual procedure becomes a command.
+- A post-swap compatibility self-check. The deployed runtime is made to load the deployed configuration — the only pair of managed files that constrain each other — and the launcher is confirmed executable. If it fails, the previous generation is restored automatically and the staging directory is left for inspection. That is what makes a file-by-file replacement safe in effect: an intermediate state either works, or is detected and undone.
+- A deployment reports in-flight tasks by reading the state database read-only, and `--require-idle` refuses to deploy while any exist. The default is to report and proceed, because a task provably continues across a deployment.
+- `deploy_project.py --verify` now covers `windows_cmd` as well as `posix_sh`.
+- `tests/test_upgrade.py` asserts the deployment scripts' ordering properties for both adapters — every hash check before every replacement, a read-only verify script, rollback only from the retained generation, the launcher executable before it lands — and adds two cross-version tests that take the previous release's runtime out of Git history, claim a task with it, finish that task with the checked-out runtime, and confirm the previous runtime can still read state the current one wrote.
+
+### Changed
+
+- `--dry-run` also reports the in-flight tasks, so it now contacts the authority. It remains read-only.
+
+### Upgrade notes
+
+Configuration schema 1 and database schema 4 are unchanged: no new columns, no destructive migration, no change to CLI parameters or fnmatch semantics. Update the private configuration's `agenthub_version` to 2.3.4 — the audit requires the registration and the runtime to agree.
+
+A deployment now retains one previous generation, and the next deployment replaces it, so `--rollback` undoes the most recent deployment only. The state database is still never part of a deployment; backing it up remains a separate, SQLite-aware step.
+
+The `windows_cmd` verification path and the Windows activation changes are covered by script-level tests only and have not been exercised against a real Windows authority.
+
+See `docs/PROJECT_REGISTRATION.md`, section "Upgrading an existing registration", for the full runbook.
+
 ## 2.3.3 — 2026-10-15
 
 ### Fixed

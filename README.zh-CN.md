@@ -1,4 +1,4 @@
-# AgentHub Core 2.3.3
+# AgentHub Core 2.3.4
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -57,7 +57,7 @@ python agent_hub.py --project <project_id> --device <device_id> context <decider
 python agent_hub.py --project <project_id> --device <device_id> next <executor_agent_id>
 ```
 
-在本地权威主机使用显式私有配置时，采用 `--local --config <config_file>`。始终声明执行设备。2.3.3 保留 2.3.1 的 CLI 参数与配置格式。
+在本地权威主机使用显式私有配置时，采用 `--local --config <config_file>`。始终声明执行设备。2.3.4 保留 2.3.1 的 CLI 参数与配置格式。
 
 | 命令 | 用途 |
 | --- | --- |
@@ -90,17 +90,19 @@ python scripts/check_release.py
 ```sh
 python scripts/deploy_project.py --project <project_id> --dry-run
 python scripts/deploy_project.py --project <project_id>
+python scripts/deploy_project.py --project <project_id> --verify
+python scripts/deploy_project.py --project <project_id> --rollback
 python scripts/smoke_project.py --config <config_file> --runtime agent_hub.py
 ```
 
-部署会校验文件哈希并逐个替换文件，但不提供跨文件事务。应单独备份权威状态，仅在明确需要重建状态时使用 `--reset-state`。烟雾测试将配置中的仓库克隆到临时目录，使用独立状态和 worktree，不调用私有启动器或部署文件；它用合成任务 ID 验证通用生命周期，命名规则由单元测试覆盖。单元测试创建临时仓库，无需 SSH 或私有项目注册。
+部署逐个替换受管文件，因此不构成跨文件事务。它保证的顺序是：所有暂存文件在**任何**替换之前先逐个校验哈希；被替换的那一代先留存；换入后强制让**部署后的运行时加载部署后的配置**（唯一互相约束的一对受管文件）。自检失败会自动还原上一代，因此中间态要么可用、要么被检测并撤销。`--rollback` 按需还原留存的那一代，`--verify` 按哈希比对已部署文件与注册副本。权威状态从不参与部署：请单独以 SQLite 方式备份，并且只在明确需要重建状态时使用 `--reset-state`。烟雾测试将配置中的仓库克隆到临时目录，使用独立状态和 worktree，不调用私有启动器或部署文件；它用合成任务 ID 验证通用生命周期，命名规则由单元测试覆盖，`tests/test_upgrade.py` 覆盖「在途任务跨版本升级」。单元测试创建临时仓库，无需 SSH 或私有项目注册。
 
 消息传输通道保持关闭；旧 Feishu/Lark 实现未包含在仓库中。Agent 身份和角色校验用于组织可信工作流，不为不可信网络用户提供身份认证。
 
 ## 从 2.3.1 升级
 
-1. 暂停权威主机命令，使用 SQLite 备份机制，或在权威服务停止后备份状态库。按自己的变更流程保留旧运行时，以便回滚。
-2. 阅读[变更记录](CHANGELOG.md)，安装 2.3.3 运行时，并将私有配置中的 `agenthub_version` 更新为 `2.3.3`，使结构审计与运行时版本一致。
+1. 暂停权威主机命令，使用 SQLite 备份机制，或在权威服务停止后备份状态库。回滚不再需要你另行保留旧运行时：部署会留存它替换掉的那一代，`--rollback` 可将其还原。
+2. 阅读[变更记录](CHANGELOG.md)，安装 2.3.4 运行时，并将私有配置中的 `agenthub_version` 更新为 `2.3.4`，使结构审计与运行时版本一致。
 3. 配置 schema 仍为 **1**，数据库 schema 仍为 **4**。历史任务与检查点保留，不新增数据库列或执行破坏性迁移。
 4. 普通交接前保存本轮检查点。以前被接受的不完整替代合同、重复序号和涉及禁止路径的重命名，现在会被拒绝；不会改写历史合同。
 5. 运行结构审计、测试和隔离烟雾测试；恢复任务前，按部署流程验证真实启动器。
