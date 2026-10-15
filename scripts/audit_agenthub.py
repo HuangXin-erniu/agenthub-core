@@ -21,6 +21,63 @@ def instruction_files(value: object) -> set[str]:
     return set()
 
 
+def phase_tokens(value: object) -> set[str]:
+    """Expand a PHASE catalogue string such as "P00-P04/P99" into its tokens."""
+    tokens: set[str] = set()
+    for chunk in str(value).split("/"):
+        chunk = chunk.strip()
+        span = re.fullmatch(r"(P\d\d)-(P\d\d)", chunk)
+        if span:
+            low, high = int(span.group(1)[1:]), int(span.group(2)[1:])
+            tokens.update(f"P{index:02d}" for index in range(low, high + 1))
+        elif chunk:
+            tokens.add(chunk)
+    return tokens
+
+
+def catalogue_values(mapping: object) -> set[str]:
+    """Every string listed across a phase_domains / domain_types mapping."""
+    if not isinstance(mapping, dict):
+        return set()
+    return {item for value in mapping.values() if isinstance(value, (list, tuple, set))
+            for item in value if isinstance(item, str)}
+
+
+def naming_findings(naming: object, label: str) -> list[str]:
+    """The advertised catalogue must name exactly what the runtime enforces.
+
+    The runtime accepts a phase only if it is a phase_domains key, a domain only if some phase
+    allows it, and a type only if some domain allows it (agent_hub.py:599-608). enum_description
+    is label text the runtime never reads, so without this check a catalogue can advertise
+    phases and domains that are impossible to use and still be reported as consistent.
+    domain_types may list unused vocabulary; what it must not do is contradict the strings.
+    """
+    findings: list[str] = []
+    if not isinstance(naming, dict) or not naming:
+        return findings
+    if "seq_offset" in naming:
+        findings.append(f"naming:seq-offset-ignored:{label}")
+    description = naming.get("enum_description")
+    if not isinstance(description, dict):
+        return findings
+    phase_domains = naming.get("phase_domains") if isinstance(naming.get("phase_domains"), dict) else {}
+    domain_types = naming.get("domain_types") if isinstance(naming.get("domain_types"), dict) else {}
+    if phase_domains:
+        declared = set(phase_domains)
+        claimed = phase_tokens(description.get("PHASE", ""))
+        if claimed != declared:
+            findings.append(f"naming:phase:{label}:{sorted(claimed ^ declared)}")
+    domains_allowed = catalogue_values(phase_domains)
+    claimed_domains = {chunk.strip() for chunk in str(description.get("DOMAIN", "")).split("/") if chunk.strip()}
+    if claimed_domains != domains_allowed:
+        findings.append(f"naming:domain:{label}:{sorted(claimed_domains ^ domains_allowed)}")
+    types_allowed = catalogue_values(domain_types)
+    claimed_types = {chunk.strip() for chunk in str(description.get("TYPE", "")).split("/") if chunk.strip()}
+    if claimed_types != types_allowed:
+        findings.append(f"naming:type:{label}:{sorted(claimed_types ^ types_allowed)}")
+    return findings
+
+
 def audit(root: Path = ROOT) -> dict:
     root = root.resolve()
     findings: list[str] = []
@@ -50,6 +107,7 @@ def audit(root: Path = ROOT) -> dict:
         for name in ("task_pattern", "chain_pattern"):
             if "seq" not in re.compile(template["task_naming"][name]).groupindex:
                 findings.append(f"template:{name}")
+        findings.extend(naming_findings(template.get("task_naming"), "template"))
     except (OSError, ValueError, KeyError, TypeError, re.error):
         findings.append("template:invalid")
 
@@ -74,6 +132,7 @@ def audit(root: Path = ROOT) -> dict:
             findings.append(f"config:transport:{label}")
         if config["state_authority"].get("policy") != "single_authority_local":
             findings.append(f"config:authority:{label}")
+        findings.extend(naming_findings(config.get("task_naming"), label))
         allowed_states.add(Path(config["state_authority"]["database"]).resolve())
         for category, value in (
             ("repository", config["execution"]["repository"]),

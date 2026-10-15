@@ -324,7 +324,7 @@ class IntegrityTests(unittest.TestCase):
         with self.database() as conn:
             self.assertEqual(conn.execute("PRAGMA table_info(tasks)").fetchall(), columns)
             self.assertEqual(dict(conn.execute("SELECT key,value FROM metadata"))["schema_version"], "4")
-            self.assertEqual(dict(conn.execute("SELECT key,value FROM metadata"))["agenthub_version"], "2.3.2")
+            self.assertEqual(dict(conn.execute("SELECT key,value FROM metadata"))["agenthub_version"], hub.VERSION)
         self.handoff()
 
     def seeded_claim(self, names, allowed, forbidden):

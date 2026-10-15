@@ -113,11 +113,43 @@ def deploy_posix(host: str, root: str, staging: str, entries: list[dict[str, str
     run(["ssh", host, "sh", "-c", shlex.quote("; ".join(commands))])
 
 
+def verify_posix(host: str, root: str, entries: list[dict[str, str | Path]]) -> list[dict[str, object]]:
+    """Compare the registry sources against what is deployed, without writing anything.
+
+    A deployed copy that has drifted from its source is invisible to the structural audit,
+    which is local and static; this is the read-only half of the deployment contract.
+    """
+    script = "; ".join(
+        f"sha256sum {shlex.quote(root + '/' + str(entry['destination']))}" for entry in entries
+    )
+    result = subprocess.run(
+        ["ssh", host, "sh", "-c", shlex.quote(script)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+    )
+    deployed_by_path: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 2:
+            deployed_by_path[fields[-1]] = fields[0]
+    report: list[dict[str, object]] = []
+    for entry in entries:
+        expected = str(entry["sha256"])
+        deployed = deployed_by_path.get(root + "/" + str(entry["destination"]))
+        report.append({
+            "destination": str(entry["destination"]),
+            "registry": expected,
+            "deployed": deployed,
+            "match": deployed == expected,
+        })
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
     parser.add_argument("--reset-state", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--verify", action="store_true")
     args = parser.parse_args(argv)
     project_dir = ROOT / "projects" / args.project
     config_path = project_dir / "project.json"
@@ -144,6 +176,16 @@ def main(argv: list[str] | None = None) -> int:
     separator = "\\" if shell == "windows_cmd" else "/"
     staging = project_root + separator + ".agenthub" + separator + "staging-v23"
     state = config["state_authority"]["database"]
+    if args.verify:
+        if shell != "posix_sh":
+            raise SystemExit("--verify is implemented for posix_sh alone; compare the deployed "
+                             "files on a windows_cmd authority by hand")
+        report = verify_posix(host, project_root, entries)
+        ok = all(item["match"] for item in report)
+        print(json.dumps({
+            "verify": True, "ok": ok, "project": args.project, "host": host, "files": report,
+        }, ensure_ascii=False, indent=2))
+        return 0 if ok else 1
     if shell == "windows_cmd":
         deploy_windows(host, project_root, staging, entries, args.reset_state, state, is_local_windows_target(host))
     else:

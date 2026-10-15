@@ -1,4 +1,4 @@
-# AgentHub Core 2.3.2
+# AgentHub Core 2.3.3
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -57,7 +57,7 @@ python agent_hub.py --project <project_id> --device <device_id> context <decider
 python agent_hub.py --project <project_id> --device <device_id> next <executor_agent_id>
 ```
 
-For a local authority with an explicit private configuration, use `--local --config <config_file>`. Always declare the executing device. Version 2.3.2 retains the 2.3.1 CLI parameters and configuration format.
+For a local authority with an explicit private configuration, use `--local --config <config_file>`. Always declare the executing device. Version 2.3.3 retains the 2.3.1 CLI parameters and configuration format.
 
 | Commands | Purpose |
 | --- | --- |
@@ -100,7 +100,7 @@ Messaging transports are disabled. Legacy Feishu/Lark implementations are omitte
 ## Upgrade from 2.3.1
 
 1. Pause Authority commands and back up its SQLite state using an SQLite-aware backup or a stopped Authority. Keep the previous runtime available for rollback under your change process.
-2. Review the [changelog](CHANGELOG.md), install the 2.3.2 runtime and update your private configuration's `agenthub_version` to `2.3.2` so the structural audit agrees with the runtime.
+2. Review the [changelog](CHANGELOG.md), install the 2.3.3 runtime and update your private configuration's `agenthub_version` to `2.3.3` so the structural audit agrees with the runtime.
 3. Configuration schema remains **1** and database schema remains **4**. Existing task and checkpoint history is preserved; no new database columns or destructive migration are introduced.
 4. Save a current checkpoint before ordinary handoff. Previously accepted incomplete replacement contracts, repeated sequences and renames involving forbidden paths are now rejected. Historical contracts are not rewritten.
 5. Run the structural audit, tests and isolated smoke check; validate the real launcher under your deployment process before resuming tasks.

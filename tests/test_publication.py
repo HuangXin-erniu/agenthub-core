@@ -22,6 +22,7 @@ def load(name, relative):
 
 release = load("release_checks", "scripts/check_release.py")
 audit = load("publication_audit", "scripts/audit_agenthub.py")
+hub = load("agenthub_runtime", "agent_hub.py")
 
 
 class PublicationTests(unittest.TestCase):
@@ -42,7 +43,7 @@ class PublicationTests(unittest.TestCase):
             project.mkdir(parents=True)
             for name in ("AGENTS.md", "README.md"):
                 (project / name).write_text("private adapter")
-            config = {"schema_version": 1, "agenthub_version": "2.3.2", "project_id": "audit_project",
+            config = {"schema_version": 1, "agenthub_version": hub.VERSION, "project_id": "audit_project",
                       "devices": {"windows": {}},
                       "agents": {"administrator": {"roles": ["administrator"], "devices": ["windows"]}},
                       "state_authority": {"host": "windows", "database": str(root / "private-state.db"), "policy": "single_authority_local"},
@@ -59,6 +60,48 @@ class PublicationTests(unittest.TestCase):
             result = audit.audit(root)
             self.assertFalse(result["ok"])
             self.assertIn("template:transport", result["findings"])
+
+    def test_audit_rejects_a_catalogue_promising_unusable_phases(self):
+        """enum_description is label text, so only the audit can catch a contradictory one."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for relative in ["agent_hub.py", "scripts/deploy_project.py", "scripts/smoke_project.py",
+                             "scripts/check_release.py", "scripts/audit_agenthub.py", "templates/project.example.json"]:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / relative, target)
+            project = root / "projects" / "audit_project"
+            project.mkdir(parents=True)
+            for name in ("AGENTS.md", "README.md"):
+                (project / name).write_text("private adapter")
+            config = {
+                "schema_version": 1, "agenthub_version": hub.VERSION, "project_id": "audit_project",
+                "devices": {"authority": {}}, "agents": {"administrator": {"roles": ["administrator"], "devices": ["authority"]}},
+                "state_authority": {"host": "authority", "database": str(root / "private-state.db"), "policy": "single_authority_local"},
+                "execution": {"repository": str(root / "repository"), "worktree_root": str(root / "worktrees")},
+                "messaging_transports": [], "lark_workflow": "hard_disabled",
+                "task_naming": {
+                    "task_pattern": r"(?P<phase>P\d\d)-(?P<domain>[A-Z]+)-(?P<type>[A-Z]+)-(?P<seq>\d{3})",
+                    "chain_pattern": r"CHN-(?P<seq>\d{4})", "seq_digits": 3,
+                    "enum_description": {"PHASE": "P00-P02/P99", "DOMAIN": "GOV/TASK/SEC/DATA",
+                                         "TYPE": "FIX/AUDIT/FEAT"},
+                    "phase_domains": {"P00": ["GOV", "TASK", "SEC"], "P99": ["GOV", "TASK", "SEC"]},
+                    "domain_types": {"GOV": ["FIX", "AUDIT"], "TASK": ["FIX", "AUDIT", "FEAT"], "SEC": ["FIX", "AUDIT"]},
+                },
+            }
+            (project / "project.json").write_text(json.dumps(config))
+            findings = audit.audit(root)["findings"]
+            self.assertIn("naming:phase:projects/audit_project/project.json:['P01', 'P02']", findings)
+            self.assertIn("naming:domain:projects/audit_project/project.json:['DATA']", findings)
+
+            config["task_naming"]["enum_description"]["PHASE"] = "P00/P99"
+            config["task_naming"]["enum_description"]["DOMAIN"] = "GOV/TASK/SEC"
+            config["task_naming"]["seq_offset"] = 0
+            (project / "project.json").write_text(json.dumps(config))
+            findings = audit.audit(root)["findings"]
+            self.assertNotIn("naming:phase:projects/audit_project/project.json:[]", findings)
+            self.assertEqual([item for item in findings if item.startswith("naming:")],
+                             ["naming:seq-offset-ignored:projects/audit_project/project.json"])
 
     def test_redaction_and_credential_detection(self):
         token = "ghp_" + "A" * 36

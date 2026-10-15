@@ -1,4 +1,4 @@
-# AgentHub Core 2.3.2
+# AgentHub Core 2.3.3
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -57,7 +57,7 @@ python agent_hub.py --project <project_id> --device <device_id> context <decider
 python agent_hub.py --project <project_id> --device <device_id> next <executor_agent_id>
 ```
 
-在本地权威主机使用显式私有配置时，采用 `--local --config <config_file>`。始终声明执行设备。2.3.2 保留 2.3.1 的 CLI 参数与配置格式。
+在本地权威主机使用显式私有配置时，采用 `--local --config <config_file>`。始终声明执行设备。2.3.3 保留 2.3.1 的 CLI 参数与配置格式。
 
 | 命令 | 用途 |
 | --- | --- |
@@ -100,7 +100,7 @@ python scripts/smoke_project.py --config <config_file> --runtime agent_hub.py
 ## 从 2.3.1 升级
 
 1. 暂停权威主机命令，使用 SQLite 备份机制，或在权威服务停止后备份状态库。按自己的变更流程保留旧运行时，以便回滚。
-2. 阅读[变更记录](CHANGELOG.md)，安装 2.3.2 运行时，并将私有配置中的 `agenthub_version` 更新为 `2.3.2`，使结构审计与运行时版本一致。
+2. 阅读[变更记录](CHANGELOG.md)，安装 2.3.3 运行时，并将私有配置中的 `agenthub_version` 更新为 `2.3.3`，使结构审计与运行时版本一致。
 3. 配置 schema 仍为 **1**，数据库 schema 仍为 **4**。历史任务与检查点保留，不新增数据库列或执行破坏性迁移。
 4. 普通交接前保存本轮检查点。以前被接受的不完整替代合同、重复序号和涉及禁止路径的重命名，现在会被拒绝；不会改写历史合同。
 5. 运行结构审计、测试和隔离烟雾测试；恢复任务前，按部署流程验证真实启动器。

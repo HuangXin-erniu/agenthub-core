@@ -3,6 +3,7 @@
 /.agenthub/
 /.reasonix/
 /.codex/
+/.zcode/
 /.agents/skills/
 /secrets/
 /integrations/

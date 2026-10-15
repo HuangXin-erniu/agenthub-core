@@ -1,4 +1,4 @@
-# AgentHub v2.3.2 project registration standard
+# AgentHub v2.3.3 project registration standard
 
 ## Boundary
 

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("agenthub_v23", ROOT / "agent_hub.py")
@@ -34,7 +35,7 @@ class AgentHubV23Tests(unittest.TestCase):
         self.config = self.root / "project.json"
         self.worktrees = self.root / "worktrees"
         self.config.write_text(json.dumps({
-            "schema_version": 1, "agenthub_version": "2.3.2", "project_id": "test",
+            "schema_version": 1, "agenthub_version": hub.VERSION, "project_id": "test",
             "devices": {"authority": {}, "client_primary": {}, "client_secondary": {}},
             "agents": {
                 "admin_agent": {"roles": ["administrator", "decider"], "devices": ["client_primary", "client_secondary"]},
@@ -253,13 +254,17 @@ class AgentHubV23Tests(unittest.TestCase):
         with self.assertRaises(hub.HubError):
             self.call("--device", "authority", "cancel", "worker_a", "T-CANCEL", "--reason", "no reason")
 
-    def test_cancel_rejects_in_progress_status(self):
-        """Cancel only accepts ready/blocked/review status."""
+    def test_cancel_admin_can_release_in_progress_and_approved(self):
+        """in_progress and approved have no other exit; only an administrator may force them."""
         self.decide()
         self.call("--device", "client_primary", "post", "admin_agent", "--spec", self.packet("T-CIP"))
         self.call("--device", "authority", "claim", "worker_a", "T-CIP")
         with self.assertRaises(hub.HubError):
-            self.call("--device", "client_primary", "cancel", "admin_agent", "T-CIP", "--reason", "cannot cancel in_progress")
+            self.call("--device", "authority", "cancel", "worker_a", "T-CIP", "--reason", "worker may not")
+        self.call("--device", "client_primary", "cancel", "admin_agent", "T-CIP", "--reason", "claim wedged")
+        shown = json.loads(self.call("--device", "client_primary", "show", "admin_agent", "T-CIP"))
+        self.assertEqual(shown["task"]["status"], "cancelled")
+        self.assertIsNone(shown["task"]["claimed_by"])
 
     def test_cancel_ready_task(self):
         """Cancel a ready task marks it cancelled and removes from next."""
@@ -377,6 +382,73 @@ class AgentHubV23Tests(unittest.TestCase):
             hub.run([*self.base, "--device", "client_primary", "status", "admin_agent", "--all"])
         all_out = output2.getvalue()
         self.assertIn("T-CSA", all_out)
+
+
+    def test_claim_rolls_back_when_the_new_worktree_cannot_be_read(self):
+        """A git failure after the state write must leave the task claimable, not wedged."""
+        self.decide()
+        self.call("--device", "client_primary", "post", "admin_agent", "--spec", self.packet("T-RB"))
+        with mock.patch.object(hub, "task_packet", side_effect=hub.HubError("git refused")):
+            with self.assertRaises(hub.HubError):
+                self.call("--device", "authority", "claim", "worker_a", "T-RB")
+        resumed = json.loads(self.call("--device", "authority", "next", "worker_a"))["task"]
+        self.assertEqual(resumed["status"], "ready")
+        self.assertIsNone(resumed["claimed_by"])
+        claimed = json.loads(self.call("--device", "authority", "claim", "worker_a", "T-RB"))
+        self.assertEqual(claimed["status"], "in_progress")
+        self.assertTrue(Path(claimed["worktree_path"]).exists())
+
+    def test_git_argv_clears_ownership_for_the_directory_in_use(self):
+        """safe.directory must name the directory of this call, not just the main repository."""
+        target = self.worktrees / "T-X"
+        argv = hub.git_argv(str(target), "rev-parse", "HEAD")
+        self.assertEqual(argv[:2], ["git", "-c"])
+        self.assertEqual(argv[2], f"safe.directory={target.resolve()}")
+        self.assertEqual(argv[3:6], ["-C", str(target), "rev-parse"])
+
+    def test_prune_reports_first_then_removes_terminal_worktrees(self):
+        """A cancelled task keeps its worktree until prune is told to reclaim it."""
+        self.decide()
+        self.call("--device", "client_primary", "post", "admin_agent", "--spec", self.packet("T-PR"))
+        worktree = Path(json.loads(self.call("--device", "authority", "claim", "worker_a", "T-PR"))["worktree_path"])
+        self.call("--device", "client_primary", "cancel", "admin_agent", "T-PR", "--reason", "superseded by hand")
+        self.assertTrue(worktree.exists())
+
+        report = json.loads(self.call("--device", "client_primary", "prune", "admin_agent"))
+        self.assertFalse(report["applied"])
+        self.assertEqual([item["action"] for item in report["candidates"]], ["would-remove"])
+        self.assertEqual(report["candidates"][0]["task_id"], "T-PR")
+        self.assertTrue(worktree.exists())
+
+        applied = json.loads(self.call("--device", "client_primary", "prune", "admin_agent", "--apply"))
+        self.assertEqual(applied["removed"], 1)
+        self.assertFalse(worktree.exists())
+        self.assertNotIn("agenthub/T-PR", self.git("show-ref"))
+
+    def test_prune_skips_a_worktree_holding_uncommitted_changes(self):
+        self.decide()
+        self.call("--device", "client_primary", "post", "admin_agent", "--spec", self.packet("T-PD"))
+        worktree = Path(json.loads(self.call("--device", "authority", "claim", "worker_a", "T-PD"))["worktree_path"])
+        self.call("--device", "client_primary", "cancel", "admin_agent", "T-PD", "--reason", "stop")
+        (worktree / "uncommitted.txt").write_text("work in progress\n", encoding="utf-8")
+
+        report = json.loads(self.call("--device", "client_primary", "prune", "admin_agent", "--apply"))
+        self.assertEqual(report["removed"], 0)
+        self.assertEqual(report["candidates"][0]["action"], "skipped")
+        self.assertEqual(report["candidates"][0]["reason"], "uncommitted changes")
+        self.assertTrue(worktree.exists())
+
+    def test_prune_never_touches_a_live_task(self):
+        """A live worktree is listed with its reason rather than silently omitted."""
+        self.decide()
+        self.call("--device", "client_primary", "post", "admin_agent", "--spec", self.packet("T-PL"))
+        worktree = Path(json.loads(self.call("--device", "authority", "claim", "worker_a", "T-PL"))["worktree_path"])
+        report = json.loads(self.call("--device", "client_primary", "prune", "admin_agent", "--apply"))
+        self.assertEqual(report["removed"], 0)
+        self.assertEqual([(item["action"], item["reason"]) for item in report["candidates"]],
+                         [("skipped", "live task (in_progress)")])
+        self.assertTrue(worktree.exists())
+        self.assertIn("agenthub/T-PL", self.git("show-ref"))
 
 
 if __name__ == "__main__":

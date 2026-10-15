@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "agenthub_version": "2.3.2",
+  "agenthub_version": "2.3.3",
   "project_id": "<project_id>",
   "project_name": "<project_name>",
   "workflow": "decision_first",
@@ -92,11 +92,10 @@
   "task_naming": {
     "task_pattern": "(?P<phase>P\\d\\d)-(?P<domain>[A-Z]+)-(?P<type>[A-Z]+)-(?P<subject>[A-Z0-9]+)-(?P<seq>\\d{3})",
     "chain_pattern": "CHN-(?P<seq>\\d{4})",
-    "seq_offset": 0,
     "seq_digits": 3,
     "enum_description": {
-      "PHASE": "P00-P10/P90/P99",
-      "DOMAIN": "GOV/TASK/DATA/MODEL/WEB/SEC/LIFE",
+      "PHASE": "P00/P99",
+      "DOMAIN": "GOV/TASK/SEC",
       "TYPE": "FIX/AUDIT/FEAT/TRAIN/EVAL/DEPLOY"
     },
     "phase_domains": {

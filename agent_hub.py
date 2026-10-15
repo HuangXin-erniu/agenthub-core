@@ -3,6 +3,14 @@
 
 The canonical runtime and SQLite state live on the project execution host.
 Other devices are thin clients and proxy commands through SSH.
+
+Reading task state:
+  * `submissions[0].result` in `show` carries the submitted payload; `task.commit` is not set.
+  * `worktree_path` is where that task's worktree lives and is kept as history after the task
+    closes. The live state is the `worktree` block, which appears only while the directory
+    exists ({head, dirty_entries}); its absence means the worktree is gone.
+  * `close` removes the worktree recursively and `prune` reclaims the ones cancelled and
+    superseded tasks leave behind.
 """
 from __future__ import annotations
 
@@ -27,12 +35,13 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-VERSION = "2.3.2"
+VERSION = "2.3.3"
 MAX_PACKET_BYTES = 16_384
 ROOT = Path(__file__).resolve().parent
-COMMANDS = {"init", "status", "context", "next", "show", "post", "claim", "handoff", "checkpoint", "submit", "review", "close", "decision", "audit", "rpc", "cancel", "supersede"}
+COMMANDS = {"init", "status", "context", "next", "show", "post", "claim", "handoff", "checkpoint", "submit", "review", "close", "decision", "audit", "rpc", "cancel", "supersede", "prune"}
+TERMINAL_STATUSES = {"closed", "cancelled"}
 PERMISSIONS = {
-    "administrator": {"init", "post", "review", "close", "handoff", "show", "decision", "audit", "status", "context", "cancel", "supersede"},
+    "administrator": {"init", "post", "review", "close", "handoff", "show", "decision", "audit", "status", "context", "cancel", "supersede", "prune"},
     "decider": {"post", "review", "show", "decision", "audit", "status", "context"},
     "executor": {"claim", "handoff", "checkpoint", "submit", "show", "status", "context", "next"},
 }
@@ -97,6 +106,9 @@ def load_config(path: Path) -> dict[str, Any]:
         raise HubError("项目配置缺少字段: " + ", ".join(missing))
     if config["schema_version"] != 1:
         raise HubError("不支持的项目配置版本")
+    workflow = config.get("workflow")
+    if workflow is not None and workflow != "decision_first":
+        raise HubError("workflow 仅支持 decision_first")
     project_id = config.get("project_id")
     if not isinstance(project_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", project_id):
         raise HubError("project_id 只能包含字母、数字、点、下划线和连字符")
@@ -350,12 +362,26 @@ def required_list(value: dict[str, Any], field: str) -> list[Any]:
     return result
 
 
+def git_argv(repository: str, *args: str) -> list[str]:
+    """Git argv for one directory, with the ownership check pre-cleared for it.
+
+    `safe.directory` accepts an exact path only (never a glob) and is evaluated against the
+    directory git is told to operate on, so every call clears the one it is about to use.
+    Without this, each command run inside a task worktree fails with "detected dubious
+    ownership" wherever the checkout's owner differs from the running uid — an NTFS-3G mount
+    with user_id=0, for instance — and nothing in the configuration can make the runtime trust
+    that path. Note that clearing the main repository does not cover its worktrees.
+    """
+    trusted = str(Path(repository).expanduser().resolve())
+    return ["git", "-c", f"safe.directory={trusted}", "-C", repository, *args]
+
+
 def git(config: dict[str, Any], *args: str, cwd: str | None = None, check: bool = True) -> str:
     repository = cwd or config.get("execution", {}).get("repository")
     if not repository:
         raise HubError("项目未配置 execution.repository")
     result = subprocess.run(
-        ["git", "-C", repository, *args], capture_output=True, text=True,
+        git_argv(repository, *args), capture_output=True, text=True,
         encoding="utf-8", errors="replace", check=False,
     )
     if check and result.returncode:
@@ -365,7 +391,7 @@ def git(config: dict[str, Any], *args: str, cwd: str | None = None, check: bool 
 
 def changed_paths(config: dict[str, Any], base: str, commit: str, cwd: str) -> list[str]:
     result = subprocess.run(
-        ["git", "-C", cwd, "diff", "--no-renames", "--name-only", "-z", f"{base}..{commit}"],
+        git_argv(cwd, "diff", "--no-renames", "--name-only", "-z", f"{base}..{commit}"),
         capture_output=True, check=False,
     )
     if result.returncode:
@@ -382,7 +408,7 @@ def changed_paths(config: dict[str, Any], base: str, commit: str, cwd: str) -> l
 def git_ok(config: dict[str, Any], *args: str, cwd: str | None = None) -> bool:
     repository = cwd or config.get("execution", {}).get("repository")
     return subprocess.run(
-        ["git", "-C", repository, *args], capture_output=True, check=False
+        git_argv(repository, *args), capture_output=True, check=False
     ).returncode == 0
 
 
@@ -719,24 +745,32 @@ def ensure_worktree(config: dict[str, Any], row: sqlite3.Row) -> None:
 def do_claim(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, task_id: str) -> None:
     identity(config, agent, device, "claim")
     conn.execute("BEGIN IMMEDIATE")
-    row = load_task(conn, task_id)
-    if row["assignee"] != agent:
-        raise HubError(f"任务 {task_id} 已指定给 {row['assignee']}，{agent} 不得认领")
-    if row["status"] != "ready" or row["claimed_by"]:
-        raise HubError(f"任务 {task_id} 当前不可认领: {row['status']}")
-    active = conn.execute(
-        "SELECT task_id FROM tasks WHERE claimed_by=? AND status='in_progress' LIMIT 1", (agent,)
-    ).fetchone()
-    if active:
-        raise HubError(f"执行者一次只能推进一个任务；当前任务: {active['task_id']}")
-    ensure_worktree(config, row)
-    conn.execute(
-        "UPDATE tasks SET status='in_progress',claimed_by=?,active_device=?,updated_at=? WHERE task_id=?",
-        (agent, device, now(), task_id),
-    )
-    record(conn, agent, device, "task.claim", task_id, {"worktree": row["worktree_path"], "branch": row["branch"]})
-    conn.commit()
-    print(json.dumps(task_packet(conn, load_task(conn, task_id), config), ensure_ascii=False, indent=2))
+    try:
+        row = load_task(conn, task_id)
+        if row["assignee"] != agent:
+            raise HubError(f"任务 {task_id} 已指定给 {row['assignee']}，{agent} 不得认领")
+        if row["status"] != "ready" or row["claimed_by"]:
+            raise HubError(f"任务 {task_id} 当前不可认领: {row['status']}")
+        active = conn.execute(
+            "SELECT task_id FROM tasks WHERE claimed_by=? AND status='in_progress' LIMIT 1", (agent,)
+        ).fetchone()
+        if active:
+            raise HubError(f"执行者一次只能推进一个任务；当前任务: {active['task_id']}")
+        ensure_worktree(config, row)
+        conn.execute(
+            "UPDATE tasks SET status='in_progress',claimed_by=?,active_device=?,updated_at=? WHERE task_id=?",
+            (agent, device, now(), task_id),
+        )
+        record(conn, agent, device, "task.claim", task_id, {"worktree": row["worktree_path"], "branch": row["branch"]})
+        # Read the packet inside the transaction: it is the first thing that touches the new
+        # worktree with git, and a failure there must leave the task claimable rather than
+        # committed as in_progress with nobody able to reach it.
+        packet = task_packet(conn, load_task(conn, task_id), config)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    print(json.dumps(packet, ensure_ascii=False, indent=2))
 
 
 def fresh_checkpoint_event(conn: sqlite3.Connection, task_id: str, executor: str, device: str) -> sqlite3.Row | None:
@@ -924,21 +958,113 @@ def do_close(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devic
 
 
 def do_cancel(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, task_id: str, reason: str) -> None:
-    identity(config, agent, device, "cancel")
+    info = identity(config, agent, device, "cancel")
     if not reason.strip():
         raise HubError("取消原因不能为空")
     conn.execute("BEGIN IMMEDIATE")
-    row = load_task(conn, task_id)
-    if row["status"] not in {"ready", "blocked", "review"}:
-        raise HubError(f"只有 ready/blocked/review 状态可以取消，当前状态: {row['status']}")
-    stamp = now()
-    conn.execute(
-        "UPDATE tasks SET status='cancelled',claimed_by=NULL,active_device=NULL,cancelled_at=?,cancelled_by=?,cancel_reason=?,updated_at=? WHERE task_id=?",
-        (stamp, agent, reason.strip(), stamp, task_id),
-    )
-    record(conn, agent, device, "task.cancel", task_id, {"reason": reason.strip(), "previous_status": row["status"]})
-    conn.commit()
+    try:
+        row = load_task(conn, task_id)
+        # in_progress and approved have no other way out: an executor whose claim failed after
+        # the state write cannot release the task, and an approved task can be neither reworked
+        # nor closed once the merge will not happen. Administrators may cancel both; everyone
+        # else keeps the narrow ready/blocked/review rule.
+        forced = row["status"] in {"in_progress", "approved"} and "administrator" in set(info.get("roles", []))
+        if row["status"] not in {"ready", "blocked", "review"} and not forced:
+            raise HubError(
+                f"只有 ready/blocked/review 状态可以取消，当前状态: {row['status']}"
+                "；in_progress/approved 只能由管理员取消"
+            )
+        stamp = now()
+        conn.execute(
+            "UPDATE tasks SET status='cancelled',claimed_by=NULL,active_device=NULL,cancelled_at=?,cancelled_by=?,cancel_reason=?,updated_at=? WHERE task_id=?",
+            (stamp, agent, reason.strip(), stamp, task_id),
+        )
+        record(conn, agent, device, "task.cancel", task_id, {
+            "reason": reason.strip(), "previous_status": row["status"],
+            "executor": row["claimed_by"], "forced": forced,
+        })
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     print(f"已取消 {task_id}")
+
+
+def parse_worktree_listing(text: str) -> list[dict[str, Any]]:
+    """Parse `git worktree list --porcelain` into one dict per registered worktree."""
+    entries: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for line in text.splitlines():
+        if line.startswith("worktree "):
+            current = {"path": line[len("worktree "):], "branch": None, "head": None}
+            entries.append(current)
+        elif current is not None and line.startswith("HEAD "):
+            current["head"] = line[len("HEAD "):]
+        elif current is not None and line.startswith("branch "):
+            current["branch"] = line[len("branch "):].removeprefix("refs/heads/")
+    return entries
+
+
+def do_prune(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, apply_changes: bool) -> None:
+    """Reclaim worktrees nothing is working in. Cancelled and superseded tasks never release
+    theirs, and there is no other way to collect them; this reports first and only removes
+    under --apply, never touches a live task or a worktree holding uncommitted changes, and
+    never deletes a directory git does not recognise as one of its worktrees."""
+    identity(config, agent, device, "prune")
+    repository = Path(config["execution"]["repository"]).expanduser().resolve()
+    root = Path(config["execution"]["worktree_root"]).expanduser().resolve()
+    rows = conn.execute("SELECT * FROM tasks").fetchall()
+    by_path = {str(Path(row["worktree_path"]).expanduser().resolve()): row for row in rows}
+    report: list[dict[str, Any]] = []
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for entry in parse_worktree_listing(git(config, "worktree", "list", "--porcelain")):
+            resolved = Path(entry["path"]).expanduser().resolve()
+            if resolved == repository:
+                continue
+            row = by_path.get(str(resolved))
+            task_id = row["task_id"] if row else None
+            status = row["status"] if row else None
+            reason = None
+            if row is not None and status not in TERMINAL_STATUSES:
+                reason = f"live task ({status})"
+            elif row is None and not resolved.is_relative_to(root):
+                reason = "not a registered task and outside worktree_root"
+            elif not resolved.exists():
+                reason = "directory is gone; the stale entry is cleared by worktree prune"
+            else:
+                try:
+                    if git(config, "status", "--porcelain", cwd=str(resolved)):
+                        reason = "uncommitted changes"
+                except HubError:
+                    reason = "git could not read this worktree"
+            action = "skipped" if reason else ("removed" if apply_changes else "would-remove")
+            item: dict[str, Any] = {"path": str(resolved), "task_id": task_id, "status": status,
+                                    "branch": entry["branch"], "action": action}
+            if reason:
+                item["reason"] = reason
+            elif apply_changes:
+                git(config, "worktree", "remove", str(resolved))
+                branch = entry["branch"]
+                if branch and branch.startswith("agenthub/") and git_ok(config, "show-ref", "--verify", f"refs/heads/{branch}"):
+                    git(config, "branch", "-D", branch)
+                record(conn, agent, device, "worktree.prune", task_id or str(resolved),
+                       {"path": str(resolved), "branch": branch, "task_id": task_id})
+            report.append(item)
+        if apply_changes:
+            git(config, "worktree", "prune")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    print(json.dumps({
+        "applied": apply_changes,
+        "worktree_root": str(root),
+        "candidates": report,
+        "removed": sum(1 for item in report if item["action"] == "removed"),
+        "skipped": sum(1 for item in report if item["action"] == "skipped"),
+        "note": "report only; re-run with --apply to remove" if not apply_changes else "removal applied",
+    }, ensure_ascii=False, indent=2))
 
 
 def do_supersede(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, task_id: str, new_spec: str, reason: str) -> None:
@@ -1018,6 +1144,7 @@ def parser() -> argparse.ArgumentParser:
     review = subs.add_parser("review"); review.add_argument("agent"); review.add_argument("task_id"); review.add_argument("--action", choices=["approve", "rework"], required=True); review.add_argument("--note", required=True)
     close = subs.add_parser("close"); close.add_argument("agent"); close.add_argument("task_id"); close.add_argument("--merge-commit", required=True); close.add_argument("--target-branch", required=True); close.add_argument("--note", required=True)
     cancel = subs.add_parser("cancel"); cancel.add_argument("agent"); cancel.add_argument("task_id"); cancel.add_argument("--reason", required=True)
+    prune = subs.add_parser("prune"); prune.add_argument("agent"); prune.add_argument("--apply", action="store_true")
     supersede = subs.add_parser("supersede"); supersede.add_argument("agent"); supersede.add_argument("task_id"); supersede.add_argument("--spec", required=True); supersede.add_argument("--reason", required=True)
     decision = subs.add_parser("decision"); decision.add_argument("agent"); decision.add_argument("--key", required=True); decision.add_argument("--summary", required=True); decision.add_argument("--rationale", required=True)
     audit = subs.add_parser("audit"); audit.add_argument("agent"); audit.add_argument("--limit", type=int, default=50)
@@ -1076,6 +1203,7 @@ def run(argv: list[str] | None = None) -> int:
         elif args.command == "review": do_review(conn, config, args.agent, device, args.task_id, args.action, args.note)
         elif args.command == "close": do_close(conn, config, args.agent, device, args.task_id, args.merge_commit, args.target_branch, args.note)
         elif args.command == "cancel": do_cancel(conn, config, args.agent, device, args.task_id, args.reason)
+        elif args.command == "prune": do_prune(conn, config, args.agent, device, args.apply)
         elif args.command == "supersede": do_supersede(conn, config, args.agent, device, args.task_id, args.spec, args.reason)
         elif args.command == "decision": do_decision(conn, config, args.agent, device, args.key, args.summary, args.rationale)
         elif args.command == "audit": do_audit(conn, config, args.agent, device, args.limit)
