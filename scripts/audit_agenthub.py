@@ -107,8 +107,9 @@ def audit(root: Path = ROOT) -> dict:
         for name in ("task_pattern", "chain_pattern"):
             if "seq" not in re.compile(template["task_naming"][name]).groupindex:
                 findings.append(f"template:{name}")
+        hub.validate_execution_config(template["execution"])
         findings.extend(naming_findings(template.get("task_naming"), "template"))
-    except (OSError, ValueError, KeyError, TypeError, re.error):
+    except (OSError, ValueError, KeyError, TypeError, re.error, hub.HubError):
         findings.append("template:invalid")
 
     configs = sorted((root / "projects").glob("*/project.json"))
@@ -133,6 +134,16 @@ def audit(root: Path = ROOT) -> dict:
         if config["state_authority"].get("policy") != "single_authority_local":
             findings.append(f"config:authority:{label}")
         findings.extend(naming_findings(config.get("task_naming"), label))
+        instructions = config.get("instructions", {})
+        if isinstance(instructions, dict) and instructions:
+            if "common" not in instructions:
+                findings.append(f"instructions:common:{label}")
+            for agent_id, info in config["agents"].items():
+                if info.get("enabled", True) and "executor" in info.get("roles", []) and agent_id not in instructions:
+                    findings.append(f"instructions:executor:{label}:{agent_id}")
+            for key in instructions:
+                if key != "common" and key not in config["agents"]:
+                    findings.append(f"instructions:unknown-agent:{label}:{key}")
         allowed_states.add(Path(config["state_authority"]["database"]).resolve())
         for category, value in (
             ("repository", config["execution"]["repository"]),

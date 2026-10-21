@@ -1,4 +1,4 @@
-# AgentHub v2.3.4 project registration standard
+# AgentHub v2.4.0 project registration standard
 
 ## Boundary
 
@@ -31,6 +31,14 @@ No concrete value from one registration may appear in core source or another reg
 10. Deploy with `python3 scripts/deploy_project.py --project <project_id>` without resetting state.
 11. Run the authority-host smoke test before production tasks. It uses a temporary clone, state and worktree and does not invoke the private launcher. Validate the actual launcher separately under your change process.
 
+## Concurrency
+
+`execution.concurrency` defaults to `one_active_task_per_executor`. Set it to `multiple_tasks_per_executor` and declare `execution.max_active_tasks_per_executor` (1-32) to let one executor hold several in-progress tasks. An optional `agents.<id>.max_active_tasks` lowers the limit for one executor and may not exceed the project value. Only `in_progress` tasks count toward the limit; `blocked` and `review` tasks do not.
+
+Each task keeps its own worktree, branch and active device, so concurrent tasks never share a working directory. `next --available` returns the highest-priority ready task that nobody has claimed, `claim-next` selects and claims one atomically, and `release` returns a stuck `in_progress` task to `ready` without deleting its worktree. The current executor may release its own task from any device it is allowed to use; an administrator may release any task.
+
+`execution.isolation` may only be `git_worktree_per_task`. A project may not run two active tasks in the same `chain_id`.
+
 ## Upgrading an existing registration
 
 A deployment replaces the managed files on the authority. It never touches the state database, and a task that is in flight continues across it — that is asserted by `tests/test_upgrade.py`, which claims a task with the previous release's runtime and finishes it with the checked-out one.
@@ -50,7 +58,7 @@ Order of operations when upgrading:
 5. `--verify` to confirm the deployed files match the registry.
 6. If the new version turns out to be wrong, `python3 scripts/deploy_project.py --project <project_id> --rollback` restores the retained generation and re-runs the self-check. One generation is retained, so this undoes the most recent deployment; restore state from your own backup if the change involved it.
 
-What is guaranteed across versions, and what is checked: configuration schema 1 and database schema 4 stay compatible, and schema changes are additive only. `tests/test_upgrade.py` asserts that the previous release's runtime can still read state written by the current one, so a release that needs to break that has to say so explicitly.
+What is guaranteed across versions, and what is checked: configuration schema 1 and database schema 4 stay compatible, and schema changes are additive only. Existing configurations that omit the concurrency keys keep the one-task-per-executor behavior; enabling multiple tasks adds configuration, not database columns. `tests/test_upgrade.py` asserts that the previous release's runtime can still read state written by the current one, including state with two tasks in progress, so a release that needs to break that has to say so explicitly.
 
 The `windows_cmd` adapter implements the same ordering and the same self-check, but only its generated scripts are tested here; it has not been exercised against a real Windows authority.
 

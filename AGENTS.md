@@ -1,4 +1,4 @@
-# AgentHub v2.3 control-plane rules
+# AgentHub v2.4 control-plane rules
 
 This repository is a lightweight, multi-project AgentHub control plane. It must not contain business-code mirrors, production databases, datasets, models or project environments.
 
@@ -7,12 +7,12 @@ At every new session:
 1. Obtain the target `project_id`; never infer it from the last chat.
 2. Read `projects/<project_id>/project.json` as the authority for Agent identities, roles, devices, execution host and paths.
 3. Read `projects/<project_id>/AGENTS.md` plus exactly one role instruction declared by `project.json.instructions`.
-4. Deciders start with `context`; executors start with `next`.
+4. Deciders start with `context`; executors start with `next`. Additional concurrent windows use `next --available` or `claim-next`, and `release` returns a stuck task to `ready`.
 5. Use only the current project's configured authority and worktree. Never reuse paths, state or contracts from another project.
 
 AgentHub core commands and role semantics are project-neutral. Project names, Agent IDs, device IDs, operating-system paths, SSH aliases and launchers belong only to project registrations/adapters.
 
-Deciders use `show` before handling blocked/review tasks. Executors modify only the assigned authority-host worktree and use checkpoint plus handoff before changing device. Messaging transports are disabled; legacy transport code is not part of this repository.
+Deciders use `show` before handling blocked/review tasks. Executors modify only the assigned task's authority-host worktree and use checkpoint plus handoff before changing device. Only a project that configures concurrency may hold more than one in-progress task per executor; each task keeps its own worktree and active device. Messaging transports are disabled; legacy transport code is not part of this repository.
 
 Do not load full history or infer work from old chat. Ask the user before unclear, destructive, credential, network, merge/push or external-service actions.
 

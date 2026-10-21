@@ -35,15 +35,20 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-VERSION = "2.3.4"
+VERSION = "2.4.0"
 MAX_PACKET_BYTES = 16_384
 ROOT = Path(__file__).resolve().parent
-COMMANDS = {"init", "status", "context", "next", "show", "post", "claim", "handoff", "checkpoint", "submit", "review", "close", "decision", "audit", "rpc", "cancel", "supersede", "prune"}
+COMMANDS = {"init", "status", "context", "next", "show", "post", "claim", "claim-next", "handoff", "checkpoint", "submit", "review", "close", "decision", "audit", "rpc", "cancel", "supersede", "release", "prune"}
 TERMINAL_STATUSES = {"closed", "cancelled"}
+CONCURRENCY_ONE = "one_active_task_per_executor"
+CONCURRENCY_MULTI = "multiple_tasks_per_executor"
+CONCURRENCY_MODES = {CONCURRENCY_ONE, CONCURRENCY_MULTI}
+ISOLATION_MODES = {"git_worktree_per_task"}
+MAX_ACTIVE_TASKS_CEILING = 32
 PERMISSIONS = {
-    "administrator": {"init", "post", "review", "close", "handoff", "show", "decision", "audit", "status", "context", "cancel", "supersede", "prune"},
+    "administrator": {"init", "post", "review", "close", "handoff", "show", "decision", "audit", "status", "context", "cancel", "supersede", "release", "prune"},
     "decider": {"post", "review", "show", "decision", "audit", "status", "context"},
-    "executor": {"claim", "handoff", "checkpoint", "submit", "show", "status", "context", "next"},
+    "executor": {"claim", "handoff", "checkpoint", "submit", "show", "status", "context", "next", "release"},
 }
 
 
@@ -95,6 +100,34 @@ def config_path(project: str | None, explicit: str | None) -> Path:
     return ROOT / "projects" / project / "project.json"
 
 
+def validate_execution_config(execution: dict[str, Any]) -> None:
+    concurrency = execution.get("concurrency", CONCURRENCY_ONE)
+    if concurrency not in CONCURRENCY_MODES:
+        raise HubError(f"execution.concurrency 仅支持 {sorted(CONCURRENCY_MODES)}")
+    isolation = execution.get("isolation", "git_worktree_per_task")
+    if isolation not in ISOLATION_MODES:
+        raise HubError(f"execution.isolation 仅支持 {sorted(ISOLATION_MODES)}")
+    maximum = execution.get("max_active_tasks_per_executor")
+    if concurrency == CONCURRENCY_MULTI:
+        if maximum is None:
+            raise HubError("启用多任务时必须声明 execution.max_active_tasks_per_executor")
+        if type(maximum) is not int or not 1 <= maximum <= MAX_ACTIVE_TASKS_CEILING:
+            raise HubError(f"execution.max_active_tasks_per_executor 必须是 1..{MAX_ACTIVE_TASKS_CEILING} 的整数")
+    elif maximum is not None and (type(maximum) is not int or maximum != 1):
+        raise HubError("one_active_task_per_executor 的 execution.max_active_tasks_per_executor 只能为 1")
+
+
+def project_task_limit(config: dict[str, Any]) -> int:
+    execution = config.get("execution", {})
+    if execution.get("concurrency", CONCURRENCY_ONE) == CONCURRENCY_ONE:
+        return 1
+    return execution["max_active_tasks_per_executor"]
+
+
+def task_limit(config: dict[str, Any], agent: str) -> int:
+    return config["agents"].get(agent, {}).get("max_active_tasks", project_task_limit(config))
+
+
 def load_config(path: Path) -> dict[str, Any]:
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
@@ -131,6 +164,18 @@ def load_config(path: Path) -> dict[str, Any]:
     execution = config.get("execution", {})
     if not execution.get("repository") or not execution.get("worktree_root"):
         raise HubError("execution 必须声明 repository 和 worktree_root")
+    validate_execution_config(execution)
+    limit = project_task_limit(config)
+    for agent_id, info in config["agents"].items():
+        override = info.get("max_active_tasks")
+        if override is None:
+            continue
+        if "executor" not in info["roles"]:
+            raise HubError(f"Agent {agent_id} 不是执行者，不能声明 max_active_tasks")
+        if type(override) is not int or not 1 <= override <= MAX_ACTIVE_TASKS_CEILING:
+            raise HubError(f"Agent {agent_id} 的 max_active_tasks 必须是 1..{MAX_ACTIVE_TASKS_CEILING} 的整数")
+        if override > limit:
+            raise HubError(f"Agent {agent_id} 的 max_active_tasks 不能超过项目上限 {limit}")
     remote = config.get("remote", {})
     if remote.get("enabled"):
         if not remote.get("ssh_host") or not remote.get("project_root") or not remote.get("launcher"):
@@ -343,6 +388,24 @@ def identity(config: dict[str, Any], agent: str, device: str, action: str) -> di
     return info
 
 
+def active_task_ids(conn: sqlite3.Connection, agent: str) -> list[str]:
+    rows = conn.execute(
+        "SELECT task_id FROM tasks WHERE claimed_by=? AND status='in_progress' "
+        "ORDER BY priority, created_at, task_id", (agent,)
+    ).fetchall()
+    return [row["task_id"] for row in rows]
+
+
+def ensure_capacity(conn: sqlite3.Connection, config: dict[str, Any], agent: str) -> None:
+    limit = task_limit(config, agent)
+    active = active_task_ids(conn, agent)
+    if len(active) >= limit:
+        raise HubError(
+            f"执行者 {agent} 已达到并发上限 {limit}；当前任务: {', '.join(active)}；"
+            "请先 submit、release 或调整配置"
+        )
+
+
 def required_text(value: dict[str, Any], field: str, max_length: int = 4000) -> str:
     result = value.get(field)
     if not isinstance(result, str) or not result.strip():
@@ -495,16 +558,26 @@ def submission_history(conn: sqlite3.Connection, task_id: str) -> list[dict[str,
     ]
 
 
-def do_status(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, all_tasks: bool, as_json: bool) -> None:
+def do_status(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, all_tasks: bool, as_json: bool, mine: bool = False, assignee: str | None = None) -> None:
     identity(config, agent, device, "status")
-    where = "" if all_tasks else "WHERE status NOT IN ('closed','cancelled')"
+    target = agent if mine else assignee
+    if assignee is not None and assignee not in config["agents"]:
+        raise HubError(f"未知 Agent: {assignee}")
+    clauses: list[str] = []
+    params: list[Any] = []
+    if not all_tasks:
+        clauses.append("status NOT IN ('closed','cancelled')")
+    if target:
+        clauses.append("assignee=?")
+        params.append(target)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
     rows = conn.execute(
-        f"SELECT * FROM tasks {where} ORDER BY priority ASC, created_at ASC"
+        f"SELECT * FROM tasks {where} ORDER BY priority ASC, created_at ASC, task_id ASC", params
     ).fetchall()
     decisions = [dict(row) for row in conn.execute(
         "SELECT decision_key,summary,decided_by,updated_at FROM decisions ORDER BY updated_at DESC LIMIT 10"
     )]
-    result = {"project": config["project_id"], "version": VERSION, "repository": repository_snapshot(config), "tasks": [task_summary(row) for row in rows], "decisions": decisions}
+    result = {"project": config["project_id"], "version": VERSION, "repository": repository_snapshot(config), "filter": {"assignee": target}, "tasks": [task_summary(row) for row in rows], "decisions": decisions}
     if as_json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
@@ -520,44 +593,66 @@ def do_status(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devi
 def do_context(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str) -> None:
     info = identity(config, agent, device, "context")
     roles = set(info["roles"])
-    if "executor" in roles:
+    is_executor = "executor" in roles
+    limit = task_limit(config, agent) if is_executor else None
+    active = len(active_task_ids(conn, agent)) if is_executor else None
+    if is_executor:
         row = conn.execute(
             "SELECT * FROM tasks WHERE assignee=? AND status IN ('in_progress','blocked','review','ready') "
-            "ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'blocked' THEN 1 WHEN 'review' THEN 2 ELSE 3 END,priority,created_at LIMIT 1",
+            "ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'blocked' THEN 1 WHEN 'review' THEN 2 ELSE 3 END,priority,created_at,task_id LIMIT 1",
             (agent,),
         ).fetchone()
         tasks = [task_packet(conn, row, config)] if row else []
     else:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE status IN ('ready','in_progress','blocked','review','approved') AND status != 'cancelled' ORDER BY priority,created_at"
+            "SELECT * FROM tasks WHERE status IN ('ready','in_progress','blocked','review','approved') AND status != 'cancelled' ORDER BY priority,created_at,task_id"
         ).fetchmany(25)
         tasks = [task_summary(row) for row in rows]
     decisions = [dict(row) for row in conn.execute(
         "SELECT decision_key,summary,rationale,decided_by,updated_at FROM decisions ORDER BY updated_at DESC LIMIT 10"
     )]
-    print(json.dumps({
+    if is_executor and limit == 1:
+        rule = "决策者发布不可变执行合同并复核；执行者一次只推进一个活动任务；换设备必须 checkpoint 后 handoff。"
+    elif is_executor:
+        rule = f"决策者发布不可变执行合同并复核；执行者最多同时推进 {limit} 个活动任务，用 next --available 或 claim-next 领取新任务；换设备必须 checkpoint 后 handoff。"
+    else:
+        rule = "决策者发布不可变执行合同并复核；执行者按项目并发上限推进任务；换设备必须 checkpoint 后 handoff。"
+    payload: dict[str, Any] = {
         "project": config["project_id"], "agent": agent, "roles": info["roles"], "device": device,
         "repository": repository_snapshot(config),
-        "operating_rule": "决策者发布不可变执行合同并复核；执行者只执行一个分配任务；换设备必须 checkpoint 后 handoff。",
+        "operating_rule": rule,
         "decisions": decisions, "tasks": tasks,
         "detail_rule": "blocked/review 必须 show 后决策；approved 等待用户确认合并，再由 Codex close。",
-    }, ensure_ascii=False, indent=2))
+    }
+    if is_executor:
+        payload["concurrency"] = {"active": active, "limit": limit}
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
-def do_next(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str) -> None:
+def do_next(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, available: bool = False) -> None:
     identity(config, agent, device, "next")
-    row = conn.execute(
-        "SELECT * FROM tasks WHERE assignee=? AND status IN ('in_progress','blocked','review','ready') AND status != 'cancelled' "
-        "ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'blocked' THEN 1 WHEN 'review' THEN 2 ELSE 3 END,priority,created_at LIMIT 1",
-        (agent,),
-    ).fetchone()
+    if available:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE assignee=? AND status='ready' AND claimed_by IS NULL "
+            "ORDER BY priority,created_at,task_id LIMIT 1",
+            (agent,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE assignee=? AND status IN ('in_progress','blocked','review','ready') AND status != 'cancelled' "
+            "ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'blocked' THEN 1 WHEN 'review' THEN 2 ELSE 3 END,priority,created_at,task_id LIMIT 1",
+            (agent,),
+        ).fetchone()
     packet = task_packet(conn, row, config) if row else None
     if packet:
         packet["device_access"] = (
             "active" if not row["active_device"] or row["active_device"] == device
             else f"handoff_required_from:{row['active_device']}"
         )
-    print(json.dumps({"task": packet}, ensure_ascii=False, indent=2))
+    print(json.dumps({
+        "task": packet,
+        "concurrency": {"active": len(active_task_ids(conn, agent)), "limit": task_limit(config, agent)},
+    }, ensure_ascii=False, indent=2))
 
 
 def do_show(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, task_id: str) -> None:
@@ -742,35 +837,87 @@ def ensure_worktree(config: dict[str, Any], row: sqlite3.Row) -> None:
     git(config, *args)
 
 
+def claim_task(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, row: sqlite3.Row) -> dict[str, Any]:
+    task_id = row["task_id"]
+    if row["assignee"] != agent:
+        raise HubError(f"任务 {task_id} 已指定给 {row['assignee']}，{agent} 不得认领")
+    if row["status"] != "ready" or row["claimed_by"]:
+        raise HubError(f"任务 {task_id} 当前不可认领: {row['status']}")
+    ensure_capacity(conn, config, agent)
+    ensure_worktree(config, row)
+    conn.execute(
+        "UPDATE tasks SET status='in_progress',claimed_by=?,active_device=?,updated_at=? WHERE task_id=?",
+        (agent, device, now(), task_id),
+    )
+    record(conn, agent, device, "task.claim", task_id, {"worktree": row["worktree_path"], "branch": row["branch"]})
+    # Read the packet inside the transaction: it is the first thing that touches the new
+    # worktree with git, and a failure there must leave the task claimable rather than
+    # committed as in_progress with nobody able to reach it.
+    return task_packet(conn, load_task(conn, task_id), config)
+
+
 def do_claim(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, task_id: str) -> None:
     identity(config, agent, device, "claim")
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = load_task(conn, task_id)
-        if row["assignee"] != agent:
-            raise HubError(f"任务 {task_id} 已指定给 {row['assignee']}，{agent} 不得认领")
-        if row["status"] != "ready" or row["claimed_by"]:
-            raise HubError(f"任务 {task_id} 当前不可认领: {row['status']}")
-        active = conn.execute(
-            "SELECT task_id FROM tasks WHERE claimed_by=? AND status='in_progress' LIMIT 1", (agent,)
-        ).fetchone()
-        if active:
-            raise HubError(f"执行者一次只能推进一个任务；当前任务: {active['task_id']}")
-        ensure_worktree(config, row)
-        conn.execute(
-            "UPDATE tasks SET status='in_progress',claimed_by=?,active_device=?,updated_at=? WHERE task_id=?",
-            (agent, device, now(), task_id),
-        )
-        record(conn, agent, device, "task.claim", task_id, {"worktree": row["worktree_path"], "branch": row["branch"]})
-        # Read the packet inside the transaction: it is the first thing that touches the new
-        # worktree with git, and a failure there must leave the task claimable rather than
-        # committed as in_progress with nobody able to reach it.
-        packet = task_packet(conn, load_task(conn, task_id), config)
+        packet = claim_task(conn, config, agent, device, row)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     print(json.dumps(packet, ensure_ascii=False, indent=2))
+
+
+def do_claim_next(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str) -> None:
+    identity(config, agent, device, "claim")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE assignee=? AND status='ready' AND claimed_by IS NULL "
+            "ORDER BY priority,created_at,task_id LIMIT 1",
+            (agent,),
+        ).fetchone()
+        packet = claim_task(conn, config, agent, device, row) if row else None
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    print(json.dumps({
+        "task": packet,
+        "concurrency": {"active": len(active_task_ids(conn, agent)), "limit": task_limit(config, agent)},
+    }, ensure_ascii=False, indent=2))
+
+
+def do_release(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, task_id: str, reason: str) -> None:
+    info = identity(config, agent, device, "release")
+    if not reason.strip():
+        raise HubError("释放原因不能为空")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = load_task(conn, task_id)
+        if row["status"] != "in_progress":
+            raise HubError(f"只有 in_progress 任务可以释放，当前状态: {row['status']}")
+        forced = row["claimed_by"] != agent
+        if forced and "administrator" not in set(info.get("roles", [])):
+            raise HubError("只有当前执行者或管理员可以释放任务")
+        cursor = conn.execute(
+            "UPDATE tasks SET status='ready',claimed_by=NULL,active_device=NULL,updated_at=? "
+            "WHERE task_id=? AND status='in_progress'",
+            (now(), task_id),
+        )
+        if cursor.rowcount != 1:
+            raise HubError("任务状态已被其他命令改变，释放失败")
+        record(conn, agent, device, "task.release", task_id, {
+            "executor": row["claimed_by"], "previous_status": row["status"],
+            "worktree": row["worktree_path"], "branch": row["branch"],
+            "reason": reason.strip(), "forced": forced,
+        })
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    print(f"已释放 {task_id} -> ready")
 
 
 def fresh_checkpoint_event(conn: sqlite3.Connection, task_id: str, executor: str, device: str) -> sqlite3.Row | None:
@@ -831,18 +978,22 @@ def do_checkpoint(conn: sqlite3.Connection, config: dict[str, Any], agent: str, 
     if not isinstance(evidence, list) or len(evidence) > 20 or any(not isinstance(item, str) for item in evidence):
         raise HubError("checkpoint.evidence 必须是不超过 20 个字符串的数组")
     conn.execute("BEGIN IMMEDIATE")
-    row = load_task(conn, task_id)
-    if row["claimed_by"] != agent or row["status"] != "in_progress":
-        raise HubError("只能为自己正在执行的任务写入 checkpoint")
-    if row["active_device"] != device:
-        raise HubError(f"任务活动设备是 {row['active_device']}；请先从活动设备执行 handoff")
-    conn.execute(
-        "INSERT INTO checkpoints(task_id,agent_id,device,summary,next_step,evidence_json,created_at) VALUES(?,?,?,?,?,?,?)",
-        (task_id, agent, device, summary, next_step, json_dump(evidence), now()),
-    )
-    conn.execute("UPDATE tasks SET updated_at=? WHERE task_id=?", (now(), task_id))
-    record(conn, agent, device, "task.checkpoint", task_id, {"summary": summary, "next_step": next_step})
-    conn.commit()
+    try:
+        row = load_task(conn, task_id)
+        if row["claimed_by"] != agent or row["status"] != "in_progress":
+            raise HubError("只能为自己正在执行的任务写入 checkpoint")
+        if row["active_device"] != device:
+            raise HubError(f"任务活动设备是 {row['active_device']}；请先从活动设备执行 handoff")
+        conn.execute(
+            "INSERT INTO checkpoints(task_id,agent_id,device,summary,next_step,evidence_json,created_at) VALUES(?,?,?,?,?,?,?)",
+            (task_id, agent, device, summary, next_step, json_dump(evidence), now()),
+        )
+        conn.execute("UPDATE tasks SET updated_at=? WHERE task_id=?", (now(), task_id))
+        record(conn, agent, device, "task.checkpoint", task_id, {"summary": summary, "next_step": next_step})
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     print(f"已保存 checkpoint {task_id}")
 
 
@@ -863,39 +1014,43 @@ def do_submit(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devi
         required_text(result, "decision_needed")
         target = "blocked"
     conn.execute("BEGIN IMMEDIATE")
-    row = load_task(conn, task_id)
-    if row["claimed_by"] != agent or row["status"] != "in_progress":
-        raise HubError("只能由当前执行者提交处于 in_progress 的任务")
-    if row["active_device"] != device:
-        raise HubError(f"任务活动设备是 {row['active_device']}；请先从活动设备执行 handoff")
-    if outcome == "completed":
-        worktree = row["worktree_path"]
-        branch = git(config, "branch", "--show-current", cwd=worktree)
-        if branch != row["branch"]:
-            raise HubError(f"worktree 当前分支不符合任务合同: {branch} != {row['branch']}")
-        head = git(config, "rev-parse", "HEAD", cwd=worktree)
-        if head != commit:
-            raise HubError(f"提交证据 commit 与 worktree HEAD 不一致: {commit} != {head}")
-        dirty = git(config, "status", "--porcelain", cwd=worktree)
-        if dirty:
-            raise HubError("worktree 仍有未提交变更；执行者必须先提交代码再申请复核")
-        if not git_ok(config, "merge-base", "--is-ancestor", row["base_commit"], commit, cwd=worktree):
-            raise HubError("提交 commit 不是任务 base_commit 的后代")
-        changed = changed_paths(config, row["base_commit"], commit, worktree)
-        allowed = json.loads(row["allowed_paths_json"])
-        forbidden = json.loads(row["forbidden_paths_json"])
-        outside = [path for path in changed if not any(fnmatch.fnmatch(path, pattern) for pattern in allowed)]
-        denied = [path for path in changed if any(fnmatch.fnmatch(path, pattern) for pattern in forbidden)]
-        if outside or denied:
-            raise HubError(f"提交文件超出合同路径边界；未授权={outside}；禁止={denied}")
-    stamp = now()
-    conn.execute(
-        "INSERT INTO submissions(task_id,agent_id,device,outcome,result_json,created_at) VALUES(?,?,?,?,?,?)",
-        (task_id, agent, device, outcome, json_dump(result), stamp),
-    )
-    conn.execute("UPDATE tasks SET status=?,result_json=?,updated_at=? WHERE task_id=?", (target, json_dump(result), stamp, task_id))
-    record(conn, agent, device, f"task.submit.{outcome}", task_id, {"summary": result["summary"]})
-    conn.commit()
+    try:
+        row = load_task(conn, task_id)
+        if row["claimed_by"] != agent or row["status"] != "in_progress":
+            raise HubError("只能由当前执行者提交处于 in_progress 的任务")
+        if row["active_device"] != device:
+            raise HubError(f"任务活动设备是 {row['active_device']}；请先从活动设备执行 handoff")
+        if outcome == "completed":
+            worktree = row["worktree_path"]
+            branch = git(config, "branch", "--show-current", cwd=worktree)
+            if branch != row["branch"]:
+                raise HubError(f"worktree 当前分支不符合任务合同: {branch} != {row['branch']}")
+            head = git(config, "rev-parse", "HEAD", cwd=worktree)
+            if head != commit:
+                raise HubError(f"提交证据 commit 与 worktree HEAD 不一致: {commit} != {head}")
+            dirty = git(config, "status", "--porcelain", cwd=worktree)
+            if dirty:
+                raise HubError("worktree 仍有未提交变更；执行者必须先提交代码再申请复核")
+            if not git_ok(config, "merge-base", "--is-ancestor", row["base_commit"], commit, cwd=worktree):
+                raise HubError("提交 commit 不是任务 base_commit 的后代")
+            changed = changed_paths(config, row["base_commit"], commit, worktree)
+            allowed = json.loads(row["allowed_paths_json"])
+            forbidden = json.loads(row["forbidden_paths_json"])
+            outside = [path for path in changed if not any(fnmatch.fnmatch(path, pattern) for pattern in allowed)]
+            denied = [path for path in changed if any(fnmatch.fnmatch(path, pattern) for pattern in forbidden)]
+            if outside or denied:
+                raise HubError(f"提交文件超出合同路径边界；未授权={outside}；禁止={denied}")
+        stamp = now()
+        conn.execute(
+            "INSERT INTO submissions(task_id,agent_id,device,outcome,result_json,created_at) VALUES(?,?,?,?,?,?)",
+            (task_id, agent, device, outcome, json_dump(result), stamp),
+        )
+        conn.execute("UPDATE tasks SET status=?,result_json=?,updated_at=? WHERE task_id=?", (target, json_dump(result), stamp, task_id))
+        record(conn, agent, device, f"task.submit.{outcome}", task_id, {"summary": result["summary"]})
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     print(f"已提交 {task_id} -> {target}")
 
 
@@ -904,56 +1059,69 @@ def do_review(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devi
     if not note.strip():
         raise HubError("复核意见不能为空")
     conn.execute("BEGIN IMMEDIATE")
-    row = load_task(conn, task_id)
-    if action == "approve":
-        if row["status"] != "review":
-            raise HubError("只有 review 状态可以批准")
-        target, claimed_by, active_device = "approved", row["claimed_by"], row["active_device"]
-    elif action == "rework":
-        if row["status"] not in {"review", "blocked"}:
-            raise HubError("只有 review/blocked 状态可以退回")
-        target, claimed_by, active_device = "ready", None, None
-    else:
-        raise HubError("action 仅允许 approve 或 rework")
-    result_value = row["result_json"] if action == "approve" else None
-    conn.execute(
-        "UPDATE tasks SET status=?,claimed_by=?,active_device=?,result_json=?,updated_at=? WHERE task_id=?",
-        (target, claimed_by, active_device, result_value, now(), task_id),
-    )
-    record(conn, agent, device, f"task.review.{action}", task_id, {"note": note.strip()})
-    conn.commit()
+    try:
+        row = load_task(conn, task_id)
+        if action == "approve":
+            if row["status"] != "review":
+                raise HubError("只有 review 状态可以批准")
+            target, claimed_by, active_device = "approved", row["claimed_by"], row["active_device"]
+        elif action == "rework":
+            if row["status"] not in {"review", "blocked"}:
+                raise HubError("只有 review/blocked 状态可以退回")
+            target, claimed_by, active_device = "ready", None, None
+        else:
+            raise HubError("action 仅允许 approve 或 rework")
+        result_value = row["result_json"] if action == "approve" else None
+        conn.execute(
+            "UPDATE tasks SET status=?,claimed_by=?,active_device=?,result_json=?,updated_at=? WHERE task_id=?",
+            (target, claimed_by, active_device, result_value, now(), task_id),
+        )
+        record(conn, agent, device, f"task.review.{action}", task_id, {"note": note.strip()})
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     print(f"已复核 {task_id} -> {target}")
 
 
 def do_close(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, task_id: str, merge_commit: str, target_branch: str, note: str) -> None:
     identity(config, agent, device, "close")
-    row = load_task(conn, task_id)
-    if row["status"] != "approved" or not row["result_json"]:
-        raise HubError("只有 approved 且保留完成结果的任务可以关闭")
-    result = json.loads(row["result_json"])
-    task_commit = required_text(result, "commit", 80)
-    if not note.strip():
-        raise HubError("关闭说明不能为空")
-    git(config, "rev-parse", "--verify", f"{merge_commit}^{{commit}}")
-    target_head = git(config, "rev-parse", "--verify", f"refs/heads/{target_branch}^{{commit}}")
-    if target_head != merge_commit:
-        raise HubError(f"merge_commit 必须是目标分支 {target_branch} 的当前 HEAD")
-    if not git_ok(config, "merge-base", "--is-ancestor", task_commit, merge_commit):
-        raise HubError("目标分支尚未包含已批准的任务 commit")
-    worktree = Path(row["worktree_path"])
-    if worktree.exists():
-        if git(config, "status", "--porcelain", cwd=str(worktree)):
-            raise HubError("任务 worktree 仍有未提交变更，不能清理")
-        git(config, "worktree", "remove", str(worktree))
-    if row["branch"] != target_branch and git_ok(config, "show-ref", "--verify", f"refs/heads/{row['branch']}"):
-        git(config, "branch", "-d", row["branch"])
     conn.execute("BEGIN IMMEDIATE")
-    conn.execute("UPDATE tasks SET status='closed',active_device=NULL,updated_at=? WHERE task_id=?", (now(), task_id))
-    record(conn, agent, device, "task.close", task_id, {
-        "task_commit": task_commit, "merge_commit": merge_commit,
-        "target_branch": target_branch, "note": note.strip(),
-    })
-    conn.commit()
+    try:
+        row = load_task(conn, task_id)
+        if row["status"] != "approved" or not row["result_json"]:
+            raise HubError("只有 approved 且保留完成结果的任务可以关闭")
+        result = json.loads(row["result_json"])
+        task_commit = required_text(result, "commit", 80)
+        if not note.strip():
+            raise HubError("关闭说明不能为空")
+        git(config, "rev-parse", "--verify", f"{merge_commit}^{{commit}}")
+        target_head = git(config, "rev-parse", "--verify", f"refs/heads/{target_branch}^{{commit}}")
+        if target_head != merge_commit:
+            raise HubError(f"merge_commit 必须是目标分支 {target_branch} 的当前 HEAD")
+        if not git_ok(config, "merge-base", "--is-ancestor", task_commit, merge_commit):
+            raise HubError("目标分支尚未包含已批准的任务 commit")
+        worktree = Path(row["worktree_path"])
+        if worktree.exists():
+            if git(config, "status", "--porcelain", cwd=str(worktree)):
+                raise HubError("任务 worktree 仍有未提交变更，不能清理")
+            git(config, "worktree", "remove", str(worktree))
+        if row["branch"] != target_branch and git_ok(config, "show-ref", "--verify", f"refs/heads/{row['branch']}"):
+            git(config, "branch", "-d", row["branch"])
+        cursor = conn.execute(
+            "UPDATE tasks SET status='closed',active_device=NULL,updated_at=? WHERE task_id=? AND status='approved'",
+            (now(), task_id),
+        )
+        if cursor.rowcount != 1:
+            raise HubError("任务状态已被其他命令改变，关闭失败")
+        record(conn, agent, device, "task.close", task_id, {
+            "task_commit": task_commit, "merge_commit": merge_commit,
+            "target_branch": target_branch, "note": note.strip(),
+        })
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     print(f"已关闭 {task_id}；目标 {target_branch}@{merge_commit}")
 
 
@@ -1103,17 +1271,21 @@ def do_decision(conn: sqlite3.Connection, config: dict[str, Any], agent: str, de
         raise HubError("决策 key、summary、rationale 均不能为空")
     stamp = now()
     conn.execute("BEGIN IMMEDIATE")
-    conn.execute(
-        "INSERT INTO decisions(decision_key,summary,rationale,decided_by,device,updated_at) VALUES(?,?,?,?,?,?) "
-        "ON CONFLICT(decision_key) DO UPDATE SET summary=excluded.summary,rationale=excluded.rationale,decided_by=excluded.decided_by,device=excluded.device,updated_at=excluded.updated_at",
-        (key, summary, rationale, agent, device, stamp),
-    )
-    conn.execute(
-        "INSERT INTO decision_revisions(decision_key,summary,rationale,decided_by,device,created_at) VALUES(?,?,?,?,?,?)",
-        (key, summary, rationale, agent, device, stamp),
-    )
-    record(conn, agent, device, "decision.set", key, {"summary": summary})
-    conn.commit()
+    try:
+        conn.execute(
+            "INSERT INTO decisions(decision_key,summary,rationale,decided_by,device,updated_at) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(decision_key) DO UPDATE SET summary=excluded.summary,rationale=excluded.rationale,decided_by=excluded.decided_by,device=excluded.device,updated_at=excluded.updated_at",
+            (key, summary, rationale, agent, device, stamp),
+        )
+        conn.execute(
+            "INSERT INTO decision_revisions(decision_key,summary,rationale,decided_by,device,created_at) VALUES(?,?,?,?,?,?)",
+            (key, summary, rationale, agent, device, stamp),
+        )
+        record(conn, agent, device, "decision.set", key, {"summary": summary})
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     print(f"已记录决策 {key}")
 
 
@@ -1133,11 +1305,14 @@ def parser() -> argparse.ArgumentParser:
     subs = value.add_subparsers(dest="command", required=True)
     init = subs.add_parser("init"); init.add_argument("agent")
     status = subs.add_parser("status"); status.add_argument("agent"); status.add_argument("--all", action="store_true"); status.add_argument("--json", action="store_true")
+    status_filter = status.add_mutually_exclusive_group(); status_filter.add_argument("--mine", action="store_true"); status_filter.add_argument("--assignee")
     context = subs.add_parser("context"); context.add_argument("agent")
-    next_task = subs.add_parser("next"); next_task.add_argument("agent")
+    next_task = subs.add_parser("next"); next_task.add_argument("agent"); next_task.add_argument("--available", action="store_true")
     show = subs.add_parser("show"); show.add_argument("agent"); show.add_argument("task_id")
     post = subs.add_parser("post"); post.add_argument("agent"); post.add_argument("--spec", required=True)
     claim = subs.add_parser("claim"); claim.add_argument("agent"); claim.add_argument("task_id")
+    claim_next = subs.add_parser("claim-next"); claim_next.add_argument("agent")
+    release = subs.add_parser("release"); release.add_argument("agent"); release.add_argument("task_id"); release.add_argument("--reason", required=True)
     handoff = subs.add_parser("handoff"); handoff.add_argument("agent"); handoff.add_argument("task_id"); handoff.add_argument("--to-device", required=True); handoff.add_argument("--note", required=True)
     checkpoint = subs.add_parser("checkpoint"); checkpoint.add_argument("agent"); checkpoint.add_argument("task_id"); checkpoint.add_argument("--progress", required=True)
     submit = subs.add_parser("submit"); submit.add_argument("agent"); submit.add_argument("task_id"); submit.add_argument("--result", required=True)
@@ -1191,12 +1366,14 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "init":
             identity(config, args.agent, device, "init")
             print(f"AgentHub {VERSION} initialized: {state}")
-        elif args.command == "status": do_status(conn, config, args.agent, device, args.all, args.json)
+        elif args.command == "status": do_status(conn, config, args.agent, device, args.all, args.json, args.mine, args.assignee)
         elif args.command == "context": do_context(conn, config, args.agent, device)
-        elif args.command == "next": do_next(conn, config, args.agent, device)
+        elif args.command == "next": do_next(conn, config, args.agent, device, args.available)
         elif args.command == "show": do_show(conn, config, args.agent, device, args.task_id)
         elif args.command == "post": do_post(conn, config, args.agent, device, args.spec)
         elif args.command == "claim": do_claim(conn, config, args.agent, device, args.task_id)
+        elif args.command == "claim-next": do_claim_next(conn, config, args.agent, device)
+        elif args.command == "release": do_release(conn, config, args.agent, device, args.task_id, args.reason)
         elif args.command == "handoff": do_handoff(conn, config, args.agent, device, args.task_id, args.to_device, args.note)
         elif args.command == "checkpoint": do_checkpoint(conn, config, args.agent, device, args.task_id, args.progress)
         elif args.command == "submit": do_submit(conn, config, args.agent, device, args.task_id, args.result)

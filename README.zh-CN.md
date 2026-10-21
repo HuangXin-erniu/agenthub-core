@@ -1,4 +1,4 @@
-# AgentHub Core 2.3.4
+# AgentHub Core 2.4.0
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -37,7 +37,7 @@ decision -> post -> claim -> checkpoint / handoff -> submit -> review
                                                            | approve -> integration -> close
 ```
 
-批准任务不会自动合并代码。应先按照正常的 Git 复核流程完成集成，再由 `close` 验证合并并移除任务 worktree。取消和替代操作保留历史。SQLite 状态由单一权威主机管理；每个任务只有一个活动设备，每名执行者同一时间只推进一个任务。
+批准任务不会自动合并代码。应先按照正常的 Git 复核流程完成集成，再由 `close` 验证合并并移除任务 worktree。取消和替代操作保留历史。SQLite 状态由单一权威主机管理；每个任务只有一个活动设备，执行者默认同时只推进一个任务，启用并发后最多推进项目配置的上限。
 
 ## 配置项目
 
@@ -57,13 +57,13 @@ python agent_hub.py --project <project_id> --device <device_id> context <decider
 python agent_hub.py --project <project_id> --device <device_id> next <executor_agent_id>
 ```
 
-在本地权威主机使用显式私有配置时，采用 `--local --config <config_file>`。始终声明执行设备。2.3.4 保留 2.3.1 的 CLI 参数与配置格式。
+在本地权威主机使用显式私有配置时，采用 `--local --config <config_file>`。始终声明执行设备。2.4.0 保留 2.3.1 的 CLI 参数与配置格式；`next --available`、`claim-next` 和 `release` 是新增命令。
 
 | 命令 | 用途 |
 | --- | --- |
 | init, status, context, next, show, audit | 初始化或查看已授权的工作流状态 |
-| decision, post, claim | 记录决策、发布合同并认领分配的任务 |
-| checkpoint, handoff, submit | 保存进度、交接活动设备并提交证据 |
+| decision, post, claim, claim-next | 记录决策、发布合同并认领分配的任务 |
+| checkpoint, handoff, submit, release | 保存进度、交接活动设备、释放任务并提交证据 |
 | review, close, cancel, supersede | 复核、验证集成，或保留取消和替代记录 |
 
 各子命令均支持 `--help`。`--spec`、`--progress` 和 `--result` 接受内联 JSON 或 `@<file>`。任务合同包含执行者、决策键、基础提交、允许和禁止路径、验收标准、验证要求、交付物及证据要求。启用 `task_naming` 时，还必须提供符合配置的链 ID 和准确的下一序号。任务包最多为 16,384 个 UTF-8 字节。
@@ -74,6 +74,7 @@ python agent_hub.py --project <project_id> --device <device_id> next <executor_a
 - **远程路由**：启用远程访问后，非 `state_authority.host` 的已注册设备通过 SSH 代理，适用于 Windows 和 POSIX 客户端。权威主机、远程访问关闭及显式 `--local` 均在本地执行。SSH 失败不会回退到本地数据库。
 - **设备交接**：当前执行者必须在活动设备上保存一个晚于最近一次认领或交接的 checkpoint。其他管理员可以通过现有交接命令恢复失联设备，但必须填写非空说明；恢复审计会记录是否缺少有效检查点。顺序依据事件 ID 判断，同一秒内的事件也能正确排序。
 - **路径边界**：提交时检查全部变更路径，重命名同时检查源路径和目标路径。禁止规则优先。以 NUL 分隔的 Git 输出保留 Unicode、空格及平台支持的特殊文件名；无法可靠解码为 UTF-8 的路径会被拒绝。保留现有 `fnmatch` 语义：`src/*` 也匹配 `src/nested/file.py`，大小写规范化遵循主机操作系统。
+- **并发任务**：每个任务保留独立的 worktree、分支和活动设备。执行者默认同时只推进一个任务；项目可以启用 `multiple_tasks_per_executor`，并通过 `max_active_tasks_per_executor` 限定上限，也可按执行者下调。`next --available` 列出未被认领的任务，`claim-next` 原子领取，`release` 把卡住的任务退回 `ready` 且不删除 worktree。只有 `in_progress` 任务占用并发名额。
 
 这些检查约束可信工作流及提交差异，不提供运行时沙箱，也不限制执行进程读取文件系统。
 
@@ -99,13 +100,14 @@ python scripts/smoke_project.py --config <config_file> --runtime agent_hub.py
 
 消息传输通道保持关闭；旧 Feishu/Lark 实现未包含在仓库中。Agent 身份和角色校验用于组织可信工作流，不为不可信网络用户提供身份认证。
 
-## 从 2.3.1 升级
+## 从 2.3.x 升级
 
 1. 暂停权威主机命令，使用 SQLite 备份机制，或在权威服务停止后备份状态库。回滚不再需要你另行保留旧运行时：部署会留存它替换掉的那一代，`--rollback` 可将其还原。
-2. 阅读[变更记录](CHANGELOG.md)，安装 2.3.4 运行时，并将私有配置中的 `agenthub_version` 更新为 `2.3.4`，使结构审计与运行时版本一致。
-3. 配置 schema 仍为 **1**，数据库 schema 仍为 **4**。历史任务与检查点保留，不新增数据库列或执行破坏性迁移。
-4. 普通交接前保存本轮检查点。以前被接受的不完整替代合同、重复序号和涉及禁止路径的重命名，现在会被拒绝；不会改写历史合同。
-5. 运行结构审计、测试和隔离烟雾测试；恢复任务前，按部署流程验证真实启动器。
+2. 阅读[变更记录](CHANGELOG.md)，安装 2.4.0 运行时，并将私有配置中的 `agenthub_version` 更新为 `2.4.0`，使结构审计与运行时版本一致。
+3. 配置 schema 仍为 **1**，数据库 schema 仍为 **4**。历史任务与检查点保留，不新增数据库列或执行破坏性迁移。未配置新字段的现有项目保持“一人一任务”行为。
+4. 如需让同一执行者并发推进多个任务，将 `execution.concurrency` 设为 `multiple_tasks_per_executor`，并将 `execution.max_active_tasks_per_executor` 设为 1..32；可用 `agents.<id>.max_active_tasks` 下调单个执行者的上限。
+5. 普通交接前保存本轮检查点。以前被接受的不完整替代合同、重复序号和涉及禁止路径的重命名，现在会被拒绝；不会改写历史合同。
+6. 运行结构审计、测试和隔离烟雾测试；恢复任务前，按部署流程验证真实启动器。
 
 公开版本不会自动部署或修改任何现有私有项目。
 

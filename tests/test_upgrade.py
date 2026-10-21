@@ -278,6 +278,26 @@ class CrossVersionTests(unittest.TestCase):
         status = json.loads(self.run_previous(runtime, "--device", "client_primary", "status", "admin_agent", "--json"))
         self.assertEqual([task["id"] for task in status["tasks"]], ["T-DOWN"])
 
+    def test_the_previous_runtime_can_read_state_with_two_tasks_in_progress(self):
+        """A newer executor can hold several tasks while an older runtime still reads them."""
+        runtime = self.previous_runtime()
+        config = json.loads(self.config.read_text(encoding="utf-8"))
+        config["execution"]["concurrency"] = "multiple_tasks_per_executor"
+        config["execution"]["max_active_tasks_per_executor"] = 2
+        self.config.write_text(json.dumps(config), encoding="utf-8")
+
+        self.decide()
+        self.run_previous(runtime, "--device", "client_primary", "post", "admin_agent", "--spec", self.packet("T-ONE"))
+        self.run_previous(runtime, "--device", "authority", "claim", "worker_a", "T-ONE")
+        self.call("--device", "client_primary", "post", "admin_agent", "--spec", self.packet("T-TWO"))
+        claimed = json.loads(self.call("--device", "authority", "claim", "worker_a", "T-TWO"))
+        self.assertEqual(claimed["status"], "in_progress")
+
+        shown = json.loads(self.run_previous(runtime, "--device", "client_primary", "show", "admin_agent", "T-ONE"))
+        self.assertEqual(shown["task"]["status"], "in_progress")
+        status = json.loads(self.run_previous(runtime, "--device", "client_primary", "status", "admin_agent", "--json"))
+        self.assertEqual(sorted(task["id"] for task in status["tasks"]), ["T-ONE", "T-TWO"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.4.0 — 2026-10-21
+
+### Added
+
+- An executor may hold more than one in-progress task when the project enables it. `execution.concurrency` accepts `one_active_task_per_executor` (default) or `multiple_tasks_per_executor`; the latter requires `execution.max_active_tasks_per_executor` (1-32), and an executor may lower its own limit with `agents.<id>.max_active_tasks`. Only `in_progress` tasks consume a slot; `blocked` and `review` do not.
+- `next --available` returns the highest-priority ready task not yet claimed, and `claim-next` selects and claims one atomically. Multiple windows using the same executor identity therefore receive distinct tasks without a separate window ID.
+- `release` returns an `in_progress` task to `ready` without deleting its worktree or branch. The current executor may release its own task from any device it is allowed to use; an administrator may release any task. This is the recovery path for a closed or crashed window.
+- `status --mine` and `status --assignee <id>` filter the task list by executor.
+- `next`, `context` and `claim-next` report `concurrency: {active, limit}`.
+- `tests/test_concurrency.py` covers the default guard, multiple tasks, limits and per-agent overrides, `next --available`, `claim-next` (including four concurrent processes), `release` permissions, `status` filters and rollback on audit failure. `tests/test_upgrade.py` adds a cross-version case where an older runtime holds one task while the new runtime claims a second.
+
+### Fixed
+
+- `close` read the task before its write transaction, so a concurrent cancel, supersede or second close could act on stale state. The whole operation now runs under `BEGIN IMMEDIATE` with a conditional `approved` update and explicit rollback.
+- `checkpoint`, `submit`, `review` and `decision` now roll back explicitly on failure instead of relying on connection close.
+- `next`, `context`, `claim` capacity checks and `status` use `priority, created_at, task_id` ordering, so equal-priority tasks are deterministic.
+- `load_config` now validates `execution.concurrency`, `execution.isolation`, `max_active_tasks_per_executor` and per-agent `max_active_tasks`; they were previously ignored.
+- The structural audit now checks the template's execution settings, requires every enabled executor to have an `instructions` mapping, and rejects instruction keys that are neither `common` nor a registered agent.
+
+### Changed
+
+- Version 2.4.0. `templates/project.example.json` documents the new execution fields. The registered project enables multiple tasks with a limit of four.
+- `README.md`, `README.zh-CN.md`, `docs/PROJECT_REGISTRATION.md`, `docs/CONTROL_PLANE_OPERATING_STANDARD.md`, `AGENTS.md` and the project role instructions describe the new commands and recovery path.
+- `tests/test_publication.py::test_unregistered_core_passes_audit` skips when a private registration is present; CI still runs it in a core-only checkout.
+
+### Upgrade notes
+
+Configuration schema 1 and database schema 4 are unchanged: no new columns, no destructive migration. Existing configurations without the new keys keep the one-task-per-executor behavior. To enable concurrency, set `execution.concurrency` to `multiple_tasks_per_executor` and `execution.max_active_tasks_per_executor` to the desired limit; optionally set `agents.<id>.max_active_tasks` to lower an individual executor's limit.
+
+Deploy the 2.4.0 runtime before invoking `claim-next`, `next --available` or `release`; older runtimes do not know those commands and will reject them. Change `agenthub_version` in the private registration to 2.4.0, as the structural audit requires the registration and runtime to agree.
+
 ## 2.3.4 — 2026-10-15
 
 ### Fixed

@@ -1,4 +1,4 @@
-# AgentHub Core 2.3.4
+# AgentHub Core 2.4.0
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -37,7 +37,7 @@ decision -> post -> claim -> checkpoint / handoff -> submit -> review
                                                            | approve -> integration -> close
 ```
 
-Approval does not merge code. Integrate through your normal reviewed Git process before `close` verifies the merge and removes the task worktree. Cancellation and replacement preserve task history. SQLite state belongs to one authority host; each task has one active device and each executor one active task.
+Approval does not merge code. Integrate through your normal reviewed Git process before `close` verifies the merge and removes the task worktree. Cancellation and replacement preserve task history. SQLite state belongs to one authority host; each task has one active device, and an executor holds one in-progress task by default or up to the project's configured limit when concurrency is enabled.
 
 ## Configure a project
 
@@ -57,13 +57,13 @@ python agent_hub.py --project <project_id> --device <device_id> context <decider
 python agent_hub.py --project <project_id> --device <device_id> next <executor_agent_id>
 ```
 
-For a local authority with an explicit private configuration, use `--local --config <config_file>`. Always declare the executing device. Version 2.3.4 retains the 2.3.1 CLI parameters and configuration format.
+For a local authority with an explicit private configuration, use `--local --config <config_file>`. Always declare the executing device. Version 2.4.0 retains the 2.3.1 CLI parameters and configuration format; `next --available`, `claim-next` and `release` are additive.
 
 | Commands | Purpose |
 | --- | --- |
 | init, status, context, next, show, audit | Initialize or inspect authorized workflow state |
-| decision, post, claim | Record a decision, publish its contract and claim assigned work |
-| checkpoint, handoff, submit | Save progress, transfer active device and submit evidence |
+| decision, post, claim, claim-next | Record a decision, publish its contract and claim assigned work |
+| checkpoint, handoff, submit, release | Save progress, transfer active device, release a task and submit evidence |
 | review, close, cancel, supersede | Review, verify integration or preserve a cancellation/replacement |
 
 Each subcommand supports `--help`. JSON arguments accept inline JSON or `@<file>` through `--spec`, `--progress` and `--result`. Task contracts bind assignee, decision key, base commit, allowed/forbidden paths, acceptance, validation, deliverables and evidence requirements. Contracts using `task_naming` also require the configured chain ID and exact next sequence. Packets are limited to 16,384 UTF-8 bytes.
@@ -74,6 +74,7 @@ Each subcommand supports `--help`. JSON arguments accept inline JSON or `@<file>
 - **Routing:** with remote access enabled, a registered device other than `state_authority.host` proxies through SSH on Windows and POSIX alike. The Authority, disabled remote access and explicit `--local` use local execution. SSH errors do not fall back to a local database.
 - **Handoff:** the current executor must save a checkpoint on the active device after the most recent claim or handoff. A different administrator can recover an unavailable device through the existing handoff command with a non-empty explanation; recovery records whether a valid checkpoint was missing. Event IDs determine order, including events occurring in the same second.
 - **Paths:** submission checks every changed path; a rename checks both source and destination. Forbidden patterns take precedence. NUL-separated Git output preserves Unicode, spaces and supported special filenames; paths that cannot be decoded reliably as UTF-8 are rejected. Existing `fnmatch` semantics remain: `src/*` also matches `src/nested/file.py`, and case normalization follows the host OS.
+- **Concurrency:** each task keeps its own worktree, branch and active device. Executors default to one in-progress task; a project may enable `multiple_tasks_per_executor` with a bounded `max_active_tasks_per_executor`, optionally lowered per executor. `next --available` lists unclaimed work, `claim-next` claims it atomically, and `release` returns a stuck task to `ready` without deleting its worktree. Only `in_progress` tasks consume a slot.
 
 These checks govern trusted workflow and committed changes. They do not sandbox running agents or prevent filesystem reads.
 
@@ -99,13 +100,14 @@ Deployment replaces managed files one by one, so it is not a transaction across 
 
 Messaging transports are disabled. Legacy Feishu/Lark implementations are omitted. Agent identities and role checks organize trusted workflow; they do not authenticate untrusted network users.
 
-## Upgrade from 2.3.1
+## Upgrade from 2.3.x
 
 1. Pause Authority commands and back up its SQLite state using an SQLite-aware backup or a stopped Authority. Nothing else needs to be kept aside for rollback: a deployment retains the generation it replaces, and `--rollback` restores it.
-2. Review the [changelog](CHANGELOG.md), install the 2.3.4 runtime and update your private configuration's `agenthub_version` to `2.3.4` so the structural audit agrees with the runtime.
-3. Configuration schema remains **1** and database schema remains **4**. Existing task and checkpoint history is preserved; no new database columns or destructive migration are introduced.
-4. Save a current checkpoint before ordinary handoff. Previously accepted incomplete replacement contracts, repeated sequences and renames involving forbidden paths are now rejected. Historical contracts are not rewritten.
-5. Run the structural audit, tests and isolated smoke check; validate the real launcher under your deployment process before resuming tasks.
+2. Review the [changelog](CHANGELOG.md), install the 2.4.0 runtime and update your private configuration's `agenthub_version` to `2.4.0` so the structural audit agrees with the runtime.
+3. Configuration schema remains **1** and database schema remains **4**. Existing task and checkpoint history is preserved; no new database columns or destructive migration are introduced. Configurations without the new execution keys keep the one-task-per-executor behavior.
+4. To enable concurrent tasks for one executor, set `execution.concurrency` to `multiple_tasks_per_executor` and `execution.max_active_tasks_per_executor` to a value from 1 to 32. Optionally lower an individual executor's limit with `agents.<id>.max_active_tasks`.
+5. Save a current checkpoint before ordinary handoff. Previously accepted incomplete replacement contracts, repeated sequences and renames involving forbidden paths are now rejected. Historical contracts are not rewritten.
+6. Run the structural audit, tests and isolated smoke check; validate the real launcher under your deployment process before resuming tasks.
 
 This public release does not deploy or modify any existing private project automatically.
 
