@@ -13,3 +13,5 @@ Keep this repository project-neutral. Do not submit private registrations, busin
 `release-files.json` is the exact public file allowlist. Update it deliberately when adding reusable source, documentation or tests; the scanner rejects unknown published paths, binary content and detected secrets. Avoid broad exclusions or disabling scanners to publish sensitive content. Git ignore rules are a convenience, not the release boundary.
 
 Use a GitHub noreply email if you do not want to publish your personal address. Follow `.gitattributes` for line endings. CI has read-only repository permissions and runs the same checks on Windows and Linux. Do not run production deployment or authority smoke tests from CI.
+
+Release tagging, version consistency and GitHub Releases follow [RELEASING.md](RELEASING.md).

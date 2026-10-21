@@ -113,4 +113,4 @@ python scripts/smoke_project.py --config <config_file> --runtime agent_hub.py
 
 ## 贡献与许可证
 
-参阅[贡献说明](CONTRIBUTING.md)、[Agent 指引](AGENTS.md)和[安全说明](SECURITY.md)。采用 [MIT 许可证](LICENSE)。
+参阅[贡献说明](CONTRIBUTING.md)、[Agent 指引](AGENTS.md)和[安全说明](SECURITY.md)。版本 tag 与 GitHub Release 流程见 [RELEASING.md](RELEASING.md)。采用 [MIT 许可证](LICENSE)。

@@ -113,4 +113,4 @@ This public release does not deploy or modify any existing private project autom
 
 ## Contributing and license
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) and [SECURITY.md](SECURITY.md). Licensed under [MIT](LICENSE).
+Read [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) and [SECURITY.md](SECURITY.md). Release tagging and GitHub Releases follow [RELEASING.md](RELEASING.md). Licensed under [MIT](LICENSE).

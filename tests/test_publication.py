@@ -24,6 +24,12 @@ release = load("release_checks", "scripts/check_release.py")
 audit = load("publication_audit", "scripts/audit_agenthub.py")
 hub = load("agenthub_runtime", "agent_hub.py")
 
+CORE_COPY = [
+    "agent_hub.py", "scripts/deploy_project.py", "scripts/smoke_project.py",
+    "scripts/check_release.py", "scripts/audit_agenthub.py", "templates/project.example.json",
+    "README.md", "README.zh-CN.md", "SECURITY.md", "docs/PROJECT_REGISTRATION.md", "CHANGELOG.md",
+]
+
 
 class PublicationTests(unittest.TestCase):
     def test_unregistered_core_passes_audit(self):
@@ -33,11 +39,24 @@ class PublicationTests(unittest.TestCase):
         self.assertTrue(result["ok"], result["findings"])
         self.assertEqual(result["projects"], 0)
 
+    def test_version_drift_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for relative in ("README.md", "README.zh-CN.md", "SECURITY.md",
+                             "docs/PROJECT_REGISTRATION.md", "CHANGELOG.md"):
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / relative, target)
+            self.assertEqual(audit.version_findings(root, hub.VERSION), [])
+            readme = root / "README.md"
+            readme.write_text(readme.read_text(encoding="utf-8").replace(hub.VERSION, "0.0.0", 1),
+                              encoding="utf-8")
+            self.assertIn("version:README.md", audit.version_findings(root, hub.VERSION))
+
     def test_private_registration_audit_accepts_generic_role_and_device_names(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for relative in ["agent_hub.py", "scripts/deploy_project.py", "scripts/smoke_project.py",
-                             "scripts/check_release.py", "scripts/audit_agenthub.py", "templates/project.example.json"]:
+            for relative in CORE_COPY:
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / relative, target)
@@ -67,8 +86,7 @@ class PublicationTests(unittest.TestCase):
         """enum_description is label text, so only the audit can catch a contradictory one."""
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for relative in ["agent_hub.py", "scripts/deploy_project.py", "scripts/smoke_project.py",
-                             "scripts/check_release.py", "scripts/audit_agenthub.py", "templates/project.example.json"]:
+            for relative in CORE_COPY:
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / relative, target)

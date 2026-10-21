@@ -78,6 +78,33 @@ def naming_findings(naming: object, label: str) -> list[str]:
     return findings
 
 
+def version_findings(root: Path, version: str) -> list[str]:
+    """The runtime version is the source of truth; every published surface must agree."""
+    findings: list[str] = []
+    markers = {
+        "README.md": f"# AgentHub Core {version}",
+        "README.zh-CN.md": f"# AgentHub Core {version}",
+        "SECURITY.md": f"AgentHub {version}",
+        "docs/PROJECT_REGISTRATION.md": f"# AgentHub v{version} project registration standard",
+    }
+    for relative, marker in markers.items():
+        try:
+            text = (root / relative).read_text(encoding="utf-8")
+        except OSError:
+            findings.append(f"version:{relative}")
+            continue
+        if marker not in text:
+            findings.append(f"version:{relative}")
+    try:
+        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    except OSError:
+        findings.append("version:CHANGELOG.md")
+    else:
+        if f"## {version} —" not in changelog:
+            findings.append("version:CHANGELOG.md")
+    return findings
+
+
 def audit(root: Path = ROOT) -> dict:
     root = root.resolve()
     findings: list[str] = []
@@ -95,6 +122,7 @@ def audit(root: Path = ROOT) -> dict:
     hub = importlib.util.module_from_spec(spec)
     assert spec.loader
     spec.loader.exec_module(hub)
+    findings.extend(version_findings(root, hub.VERSION))
 
     try:
         template = json.loads((root / "templates/project.example.json").read_text(encoding="utf-8"))

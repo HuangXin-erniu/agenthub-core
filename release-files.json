@@ -9,6 +9,7 @@
   "LICENSE",
   "README.md",
   "README.zh-CN.md",
+  "RELEASING.md",
   "SECURITY.md",
   "agent_hub.py",
   "docs/CONTROL_PLANE_OPERATING_STANDARD.md",
