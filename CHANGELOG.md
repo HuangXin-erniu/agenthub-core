@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.4.1 — 2026-10-22
+
+### Added
+
+- An executor window can declare `--session <id>` (or `AGENTHUB_SESSION`). A claim records the session, and `checkpoint`, `submit`, `handoff` and `release` reject a different window of the same executor identity. Session is caller-declared workflow metadata, like agent and device, not a credential.
+- `heartbeat <agent> <task_id> [--lease-minutes N]` refreshes `last_heartbeat_at` without writing a checkpoint. It is also the only command that binds a session to an existing `in_progress` claim, so a long task can adopt isolation after an upgrade without being released. An administrator may bind an unbound claim on the executor's behalf; a bound claim still requires the matching session.
+- `execution.session_policy` accepts `optional` (default) or `required`. In `required` projects, `claim` and `claim-next` need a session, and an unbound claim must be bound by `heartbeat` before checkpoint/submit/release.
+- `next` and `context` accept a session. With one, they show the tasks that session owns and then unclaimed ready work. Without one, `optional` projects keep the old selection for legacy unbound claims but skip every session-bound task and list it under `excluded`; `required` projects show only ready work. A window is never handed another window's in-progress task by default.
+- `claim` and `claim-next` accept `--lease-minutes N` (0-10080). A lease expires relative to the last heartbeat; expiration is reported as `lease_expired` and never triggers an automatic release. `release --if-expired` lets an administrator free only an expired claim.
+- `status` and task packets expose `claim_session`, `claim_generation`, `last_heartbeat_at` and a `lease` block. A re-claimed task exposes only checkpoints from the current claim as `checkpoint`; earlier rounds move to `previous_checkpoint`.
+
+### Fixed
+
+- `close` now commits the `closed` state and its audit event before removing the worktree or branch. A cleanup failure leaves a closed task for `prune` instead of deleting files and then rolling the state back. It also verifies that the worktree HEAD equals the approved commit.
+- Task IDs are resolved as a single directory name under `execution.worktree_root`; `.`, `..`, leading dots and path separators are rejected even when a custom `task_naming` pattern would accept them.
+- Corrupt JSON in task, checkpoint, submission, review or audit state is reported as `HubError` with the failing field instead of a `JSONDecodeError` traceback. Invalid configuration section types and invalid naming regexes are rejected at load time.
+- `task_packet` reports an unreadable worktree as `worktree: {error: ...}` instead of failing `show`/`next` during a concurrent cleanup.
+- `checkpoint.evidence` rejects blank strings; `audit --limit` is bounded to 1-1000; Git revisions and target branches are validated before use.
+- `scripts/smoke_project.py` no longer hides the original failure behind an `UnboundLocalError` in its cleanup path.
+
+### Changed
+
+- Version 2.4.1. `templates/project.example.json` documents `execution.session_policy`; the registered Merman project sets it to `required` and uses `p00-download` / `p02-forecast` as window sessions.
+- `README.md`, `README.zh-CN.md`, `docs/PROJECT_REGISTRATION.md`, `docs/CONTROL_PLANE_OPERATING_STANDARD.md`, `AGENTS.md` and the project role instructions document session ownership, heartbeat, lease warnings and migration.
+- Remote RPC carries the session in its payload so a client window keeps its identity on the authority host.
+
+### Upgrade notes
+
+Configuration schema 1 and database schema 4 are unchanged. New columns (`claim_session`, `last_heartbeat_at`, `lease_seconds`, `claim_generation`, `checkpoints.generation`) are added in place; older runtimes ignore them. Existing configurations without `execution.session_policy` keep `optional`, so session-less commands behave as before.
+
+To make a project session-safe, set `execution.session_policy` to `required`, deploy 2.4.1, and bind each running claim once with `heartbeat --session <id>`. Deploy while long tasks are in flight: deployment does not touch the SQLite state, and the runtime swap is covered by `tests/test_upgrade.py`. Do not use `--require-idle` for that upgrade. Bump the private registration's `agenthub_version` to 2.4.1.
+
 ## 2.4.0 — 2026-10-21
 
 ### Added

@@ -5,5 +5,7 @@
 - Codex alone owns system governance, lifecycle, runtime, deployment, and cross-project policy.
 - Executor tasks require immutable decision, full acceptance matrix, visible review note in next/show, acknowledgement checkpoint, and a single complete submission.
 - An executor may hold several in-progress tasks only up to the project's configured limit; each task keeps its own active device, worktree, checkpoints and submission. `release` returns a stuck task to ready without deleting its work.
+- A long task is owned by the window that claimed it. Declare a stable session per window, keep it alive with `heartbeat`, and never run `checkpoint`, `submit`, `handoff` or `release` against another session's task. Lease expiry is a warning for a human decision, not an automatic release.
+- Sessions isolate workflow ownership, not external shared state. Projects that share datasets between a producer and a consumer define atomic publishing and snapshot pinning in their own instructions.
 - Task IDs and chains are project-configured; sequence is global, monotonic, and never reused.
 - cancel and supersede preserve history. Deployment occurs only after user-approved merge and production smoke verification.

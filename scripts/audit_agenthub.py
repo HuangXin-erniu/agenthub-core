@@ -47,7 +47,8 @@ def naming_findings(naming: object, label: str) -> list[str]:
     """The advertised catalogue must name exactly what the runtime enforces.
 
     The runtime accepts a phase only if it is a phase_domains key, a domain only if some phase
-    allows it, and a type only if some domain allows it (agent_hub.py:599-608). enum_description
+    allows it, and a type only if some domain allows it (`validate_task_contract` in
+    agent_hub.py). enum_description
     is label text the runtime never reads, so without this check a catalogue can advertise
     phases and domains that are impossible to use and still be reported as consistent.
     domain_types may list unused vocabulary; what it must not do is contradict the strings.

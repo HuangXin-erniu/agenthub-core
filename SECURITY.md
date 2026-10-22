@@ -2,7 +2,7 @@
 
 ## Trust boundary
 
-AgentHub 2.4.0 is a control plane for agents and devices within a trusted environment. Agent and device IDs are caller-declared workflow identifiers, not cryptographic authentication. Git path validation checks submitted changes; it does not sandbox process execution, stop an executor from reading other files or restrict the executor's OS account. Use separate OS accounts, file permissions and sandboxing when needed.
+AgentHub 2.4.1 is a control plane for agents and devices within a trusted environment. Agent and device IDs are caller-declared workflow identifiers, not cryptographic authentication. Git path validation checks submitted changes; it does not sandbox process execution, stop an executor from reading other files or restrict the executor's OS account. Use separate OS accounts, file permissions and sandboxing when needed.
 
 The authority host owns SQLite state and canonical Git/worktree operations. Keep state and worktrees outside synchronized folders; back up state separately. Protect Git, Python, SSH configuration, launchers and project registrations from untrusted modification. Remote RPC relies on SSH access control and host identity. The internal `--local`, `--state` and RPC paths are trusted administration interfaces.
 

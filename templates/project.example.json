@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "agenthub_version": "2.4.0",
+  "agenthub_version": "2.4.1",
   "project_id": "<project_id>",
   "project_name": "<project_name>",
   "workflow": "decision_first",
@@ -48,7 +48,8 @@
     "worktree_root": "<authority-worktree-root>",
     "concurrency": "one_active_task_per_executor",
     "max_active_tasks_per_executor": 1,
-    "isolation": "git_worktree_per_task"
+    "isolation": "git_worktree_per_task",
+    "session_policy": "optional"
   },
   "remote": {
     "enabled": true,

@@ -27,5 +27,6 @@
   "tests/test_concurrency.py",
   "tests/test_integrity.py",
   "tests/test_publication.py",
+  "tests/test_sessions.py",
   "tests/test_upgrade.py"
 ]
