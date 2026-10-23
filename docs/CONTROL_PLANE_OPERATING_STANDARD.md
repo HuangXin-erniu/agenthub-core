@@ -7,5 +7,6 @@
 - An executor may hold several in-progress tasks only up to the project's configured limit; each task keeps its own active device, worktree, checkpoints and submission. `release` returns a stuck task to ready without deleting its work.
 - A long task is owned by the window that claimed it. Declare a stable session per window, keep it alive with `heartbeat`, and never run `checkpoint`, `submit`, `handoff` or `release` against another session's task. Lease expiry is a warning for a human decision, not an automatic release.
 - Sessions isolate workflow ownership, not external shared state. Projects that share datasets between a producer and a consumer define atomic publishing and snapshot pinning in their own instructions.
-- Task IDs and chains are project-configured; sequence is global, monotonic, and never reused.
+- Contracts may declare `depends_on`, numeric `gates` and `artifacts`; `claim`, `submit` and `close` enforce them. `status --decision <key>` lists a decision line.
+- Task IDs are project-configured; sequence is global, monotonic, and never reused. `chain_id` is a lineage label, not an ordering mechanism; `depends_on` expresses ordering.
 - cancel and supersede preserve history. Deployment occurs only after user-approved merge and production smoke verification.

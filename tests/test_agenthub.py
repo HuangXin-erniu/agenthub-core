@@ -78,6 +78,9 @@ class AgentHubV23Tests(unittest.TestCase):
             "validation": ["git diff --check"], "deliverables": ["one commit"],
             "evidence_requirements": ["commit", "test result"],
             "blocked_protocol": "submit blocked with facts and decision_needed",
+            # Lifecycle fixtures reuse README.md across tasks; overlap enforcement has its
+            # own tests, so the shared packet opts out explicitly.
+            "allow_path_overlap": True,
             "context_budget": 6000
         })
 

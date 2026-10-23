@@ -1,4 +1,4 @@
-# AgentHub v2.4.1 project registration standard
+# AgentHub v2.4.2 project registration standard
 
 ## Boundary
 
@@ -39,6 +39,17 @@ Each task keeps its own worktree, branch and active device, so concurrent tasks 
 
 `execution.isolation` may only be `git_worktree_per_task`. A project may not run two active tasks in the same `chain_id`.
 
+## Dependencies, gates and artifacts
+
+A task contract may carry four optional fields. They are additive: a contract without them behaves exactly as before.
+
+- `depends_on` is an array of earlier task IDs. `claim` and `claim-next` refuse a task until every dependency is `closed`; `next` and `next --available` skip it and list it under `excluded` with `reason: dependencies_unmet`. A dependency on a cancelled task cannot be posted. When a closed dependency's merge commit is not contained in the task's `base_commit`, the packet reports `dependencies.stale_base`; merge the target branch before working, or supersede with a newer base.
+- `gates` declares numeric acceptance gates: `id`, `metric`, `operator` (`>=`, `>`, `<=`, `<`), `threshold`, optional `source`. A completed submission must include `gate_results` keyed by gate ID. The runtime computes pass/fail; a failed required gate rejects `completed`, and the executor must submit `blocked` with the measurement and the trade-off. `review approve` recomputes the gates.
+- `artifacts` lists paths relative to `execution.artifact_root`. The project must configure `artifact_root` before a contract may declare artifacts, and the root may not be inside `worktree_root`. Every artifact must exist at `submit` and again at `close`.
+- `allow_path_overlap` acknowledges that the contract's `allowed_paths` overlap an active task. `post` rejects an overlap by default; tasks serialized by `depends_on` do not need the flag. The acknowledgement is recorded in the `task.post` event.
+
+`status --decision <key>` filters the task list to one decision, which is the durable grouping key for a line of work. `chain_id` remains a per-task lineage label; it does not order tasks and a chain may hold only one active task.
+
 ## Sessions and long tasks
 
 `execution.session_policy` is `optional` by default. In that mode a claim may omit a session and legacy unbound claims keep working, but any task bound to a session is skipped by `next`/`context` calls that do not present that session and is rejected by `checkpoint`, `submit`, `handoff` and `release` from a different window.
@@ -74,7 +85,9 @@ Order of operations when upgrading:
 6. If the registration uses `session_policy: required`, bind every in-flight claim before its next mutation: `heartbeat <executor> <task_id> --session <window_id>`. A run that was claimed before the upgrade has no session yet.
 7. If the new version turns out to be wrong, `python3 scripts/deploy_project.py --project <project_id> --rollback` restores the retained generation and re-runs the self-check. One generation is retained, so this undoes the most recent deployment; restore state from your own backup if the change involved it.
 
-What is guaranteed across versions, and what is checked: configuration schema 1 and database schema 4 stay compatible, and schema changes are additive only. Version 2.4.1 adds `claim_session`, `last_heartbeat_at`, `lease_seconds`, `claim_generation` and `checkpoints.generation` in place; older runtimes ignore them. Existing configurations that omit the concurrency and session keys keep the one-task-per-executor and session-optional behavior. `tests/test_upgrade.py` asserts that the previous release's runtime can still read state written by the current one, including state with two tasks in progress, so a release that needs to break that has to say so explicitly.
+What is guaranteed across versions, and what is checked: configuration schema 1 and database schema 4 stay compatible, and schema changes are additive only. Version 2.4.1 added the session columns; version 2.4.2 adds `depends_on_json`, `gates_json`, `artifacts_json` and `allow_path_overlap` in place. Older runtimes ignore them. Existing configurations that omit the concurrency and session keys keep the one-task-per-executor and session-optional behavior. `tests/test_upgrade.py` asserts that the previous release's runtime can still read state written by the current one, including state with two tasks in progress, so a release that needs to break that has to say so explicitly.
+
+For 2.4.2, review queued contracts before deploying: `post` now rejects `allowed_paths` overlaps with active tasks unless the contracts are sequenced by `depends_on` or set `allow_path_overlap: true`. Set `execution.artifact_root` only if contracts will declare `artifacts`. Gate declarations are optional and only affect contracts that use them.
 
 The `windows_cmd` adapter implements the same ordering and the same self-check, but only its generated scripts are tested here; it has not been exercised against a real Windows authority.
 

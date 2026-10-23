@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.4.2 — 2026-10-23
+
+### Added
+
+- Task contracts accept an optional `depends_on` array. `claim` and `claim-next` refuse a task until every dependency is `closed`; `next` and `next --available` skip it and report `dependencies_unmet`. Posting rejects a dependency that does not exist, is cancelled, or is the task being superseded. A packet reports `dependencies.stale_base` when a closed dependency's merge commit is not contained in the task's `base_commit`.
+- `post` and `supersede` compare the new contract's `allowed_paths` with every active task. Overlaps are rejected unless the tasks are serialized by `depends_on` or the contract sets `allow_path_overlap: true`; an explicit acknowledgement is stored in the `task.post` event. Glob patterns are compared by their static prefix, conservatively.
+- Contract `gates` (`id`, `metric`, `operator`, `threshold`, optional `source`) and submission `gate_results`. A completed submission must provide every declared gate; the runtime computes pass/fail and rejects `completed` when a required gate fails, directing the executor to submit `blocked`. `review approve` recomputes the gates.
+- `execution.artifact_root` and contract `artifacts` (relative POSIX paths). `submit` and `close` verify that every declared artifact exists; `close` refuses before removing the worktree. The root may not be inside `worktree_root`.
+- `status --decision <key>` filters by decision; `status` and `show` expose `chain_id`, `depends_on`, dependency state, gate status, `supersedes` and `superseded_by`.
+- `supersede` and `cancel` warn on stderr when an active task still depends on the affected task.
+
+### Fixed
+
+- `close` printed its success message twice.
+
+### Changed
+
+- `status` text puts the task ID first and the priority in parentheses, then prints `chain=`, `decision=`, `deps=`, `blocked_by=` and `gates=`. Scripts that parse the text form should use `--json`.
+- Version 2.4.2. `chain_id` is documented as a lineage label; ordering is expressed by `depends_on` and grouping by `decision_key`.
+
+### Upgrade notes
+
+Configuration schema 1 and database schema 4 are unchanged. `depends_on_json`, `gates_json`, `artifacts_json` and `allow_path_overlap` are added in place; older runtimes ignore them and existing contracts keep their behavior.
+
+Before posting new contracts, check that their `allowed_paths` do not overlap an active task unless they are sequenced with `depends_on` or explicitly acknowledged with `allow_path_overlap: true`. Set `execution.artifact_root` only if contracts will declare `artifacts`. A contract that declares `gates` must submit measured `gate_results`; a failed gate is a `blocked` submission, not a completed one. Bump the private registration's `agenthub_version` to 2.4.2.
+
 ## 2.4.1 — 2026-10-22
 
 ### Added

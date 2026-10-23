@@ -19,6 +19,8 @@ import base64
 import datetime as dt
 import fnmatch
 import json
+import math
+import operator as operator_module
 import os
 import platform
 import re
@@ -26,7 +28,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -35,7 +37,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-VERSION = "2.4.1"
+VERSION = "2.4.2"
 MAX_PACKET_BYTES = 16_384
 ROOT = Path(__file__).resolve().parent
 COMMANDS = {"init", "status", "context", "next", "show", "post", "claim", "claim-next", "handoff", "checkpoint", "submit", "heartbeat", "review", "close", "decision", "audit", "rpc", "cancel", "supersede", "release", "prune"}
@@ -48,6 +50,11 @@ SESSION_POLICIES = {"optional", "required"}
 SESSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 MAX_ACTIVE_TASKS_CEILING = 32
 MAX_LEASE_MINUTES = 10080
+GATE_OPERATORS = {">=", ">", "<=", "<"}
+GATE_COMPARE = {
+    ">=": operator_module.ge, ">": operator_module.gt,
+    "<=": operator_module.le, "<": operator_module.lt,
+}
 PERMISSIONS = {
     "administrator": {"init", "post", "review", "close", "handoff", "show", "decision", "audit", "status", "context", "cancel", "supersede", "release", "prune", "heartbeat"},
     "decider": {"post", "review", "show", "decision", "audit", "status", "context"},
@@ -175,6 +182,16 @@ def validate_execution_config(execution: dict[str, Any]) -> None:
             raise HubError(f"execution.max_active_tasks_per_executor 必须是 1..{MAX_ACTIVE_TASKS_CEILING} 的整数")
     elif maximum is not None and (type(maximum) is not int or maximum != 1):
         raise HubError("one_active_task_per_executor 的 execution.max_active_tasks_per_executor 只能为 1")
+    artifact_root = execution.get("artifact_root")
+    if artifact_root is not None:
+        if not isinstance(artifact_root, str) or not artifact_root.strip():
+            raise HubError("execution.artifact_root 必须是非空字符串")
+        worktree_root = execution.get("worktree_root")
+        if worktree_root:
+            artifacts = Path(artifact_root).expanduser().resolve()
+            worktrees = Path(worktree_root).expanduser().resolve()
+            if artifacts == worktrees or artifacts.is_relative_to(worktrees):
+                raise HubError("execution.artifact_root 不能位于 execution.worktree_root 之内；close 与 prune 会删除该目录")
 
 
 def project_task_limit(config: dict[str, Any]) -> int:
@@ -443,7 +460,12 @@ def initialize(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "tasks", "cancelled_at", "TEXT")
     ensure_column(conn, "tasks", "cancelled_by", "TEXT")
     ensure_column(conn, "tasks", "cancel_reason", "TEXT")
+    ensure_column(conn, "tasks", "depends_on_json", "TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(conn, "tasks", "gates_json", "TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(conn, "tasks", "artifacts_json", "TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(conn, "tasks", "allow_path_overlap", "INTEGER NOT NULL DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_chain ON tasks(chain_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_decision ON tasks(decision_key)")
     conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('schema_version','4')")
     conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('agenthub_version',?)", (VERSION,))
     conn.commit()
@@ -529,6 +551,107 @@ def required_list(value: dict[str, Any], field: str) -> list[Any]:
     return result
 
 
+def optional_string_list(value: dict[str, Any], field: str, max_length: int = 500) -> list[str]:
+    result = value.get(field, [])
+    if result is None:
+        return []
+    if not isinstance(result, list):
+        raise HubError(f"字段 {field} 必须是数组")
+    if len(result) > 20:
+        raise HubError(f"字段 {field} 最多 20 项")
+    for item in result:
+        if not isinstance(item, str) or not item.strip():
+            raise HubError(f"字段 {field} 的每一项必须是非空字符串")
+        if len(item) > max_length:
+            raise HubError(f"字段 {field} 的单项超过 {max_length} 字符")
+    return result
+
+
+def finite_number(value: Any) -> bool:
+    """True for a JSON number that can be compared without NaN/inf surprises."""
+    if type(value) is int:
+        return True
+    return type(value) is float and math.isfinite(value)
+
+
+def validate_depends_on(spec: dict[str, Any], task_id: str) -> list[str]:
+    result = optional_string_list(spec, "depends_on", max_length=120)
+    if len(set(result)) != len(result):
+        raise HubError("depends_on 不能包含重复任务 ID")
+    if task_id in result:
+        raise HubError("depends_on 不能包含任务自身")
+    return result
+
+
+def validate_gates(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = spec.get("gates", [])
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise HubError("gates 必须是数组")
+    if len(raw) > 20:
+        raise HubError("gates 最多 20 项")
+    gates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise HubError(f"gates[{index}] 必须是对象")
+        unknown = sorted(set(item) - {"id", "metric", "operator", "threshold", "source"})
+        if unknown:
+            raise HubError(f"gates[{index}] 含未知字段: {unknown}")
+        gate_id = item.get("id")
+        if not isinstance(gate_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", gate_id):
+            raise HubError(f"gates[{index}].id 必须是 1-64 位字母、数字、点、下划线或连字符")
+        if gate_id in seen:
+            raise HubError(f"gates id 重复: {gate_id}")
+        seen.add(gate_id)
+        metric = item.get("metric")
+        if not isinstance(metric, str) or not metric.strip() or len(metric) > 200:
+            raise HubError(f"gates[{gate_id}].metric 必须是 1-200 字符的非空字符串")
+        operator_value = item.get("operator")
+        if not isinstance(operator_value, str) or operator_value not in GATE_OPERATORS:
+            raise HubError(f"gates[{gate_id}].operator 仅允许 {sorted(GATE_OPERATORS)}")
+        threshold = item.get("threshold")
+        if not finite_number(threshold):
+            raise HubError(f"gates[{gate_id}].threshold 必须是有限数字")
+        source = item.get("source")
+        if source is not None and (not isinstance(source, str) or len(source) > 500):
+            raise HubError(f"gates[{gate_id}].source 必须是不超过 500 字符的字符串")
+        gate = {"id": gate_id, "metric": metric.strip(), "operator": operator_value, "threshold": threshold}
+        if source is not None:
+            gate["source"] = source
+        gates.append(gate)
+    return gates
+
+
+def validate_artifacts(spec: dict[str, Any]) -> list[str]:
+    raw = spec.get("artifacts", [])
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise HubError("artifacts 必须是数组")
+    if len(raw) > 20:
+        raise HubError("artifacts 最多 20 项")
+    result: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, str) or not item or len(item) > 500:
+            raise HubError(f"artifacts[{index}] 必须是 1-500 字符的非空字符串")
+        if "\\" in item or item.startswith("/") or re.match(r"^[A-Za-z]:", item):
+            raise HubError(f"artifacts[{index}] 必须是 artifact_root 下的相对 POSIX 路径: {item}")
+        if any(char in item for char in "*?["):
+            raise HubError(f"artifacts[{index}] 不能包含通配符: {item}")
+        pure = PurePosixPath(item)
+        if pure.is_absolute() or not pure.parts or any(part == ".." for part in pure.parts):
+            raise HubError(f"artifacts[{index}] 不能包含 ..: {item}")
+        normalized = pure.as_posix()
+        if normalized in seen:
+            raise HubError(f"artifacts 重复: {normalized}")
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
 def validate_revision(value: str, label: str) -> str:
     """Reject values Git could interpret as an option before they reach a command line."""
     if not value or value.startswith("-") or any(char.isspace() or ord(char) < 32 for char in value):
@@ -593,6 +716,155 @@ def git_ok(config: dict[str, Any], *args: str, cwd: str | None = None) -> bool:
     ).returncode == 0
 
 
+def glob_prefix_parts(pattern: str) -> list[str]:
+    """Path segments before the first wildcard; used to compare two glob patterns."""
+    parts: list[str] = []
+    for part in pattern.removeprefix("./").split("/"):
+        if any(char in part for char in "*?["):
+            break
+        parts.append(part)
+    return parts
+
+
+def path_patterns_overlap(left: str, right: str) -> bool:
+    """Conservative test for whether two allowed_paths patterns can match one path.
+
+    Literal patterns are tested with the same fnmatch semantics `submit` uses. When both
+    contain wildcards, only the static prefix is compared; that can report two patterns as
+    overlapping when they cannot, which is the safe direction for a concurrency guard.
+    """
+    left = left.removeprefix("./")
+    right = right.removeprefix("./")
+    if left == right:
+        return True
+    left_glob = any(char in left for char in "*?[")
+    right_glob = any(char in right for char in "*?[")
+    if not left_glob and not right_glob:
+        return False
+    if not left_glob and fnmatch.fnmatch(left, right):
+        return True
+    if not right_glob and fnmatch.fnmatch(right, left):
+        return True
+    left_parts = glob_prefix_parts(left)
+    right_parts = glob_prefix_parts(right)
+    shared = min(len(left_parts), len(right_parts))
+    return left_parts[:shared] == right_parts[:shared]
+
+
+def dependency_state(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    dependencies = load_state_json(row["depends_on_json"], f"tasks[{row['task_id']}].depends_on")
+    items: list[dict[str, Any]] = []
+    for task_id in dependencies:
+        dependency = conn.execute("SELECT status FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        items.append({"task_id": task_id, "status": dependency["status"] if dependency else "missing"})
+    unmet = [item for item in items if item["status"] != "closed"]
+    return {"satisfied": not unmet, "items": items, "unmet": unmet}
+
+
+def dependency_closure(conn: sqlite3.Connection, task_ids: list[str]) -> set[str]:
+    """Every task reachable through depends_on, including the starting IDs."""
+    seen: set[str] = set()
+    pending = list(task_ids)
+    while pending:
+        task_id = pending.pop()
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        row = conn.execute("SELECT depends_on_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if row:
+            pending.extend(load_state_json(row["depends_on_json"], f"tasks[{task_id}].depends_on"))
+    return seen
+
+
+def dependency_freshness(conn: sqlite3.Connection, config: dict[str, Any], row: sqlite3.Row,
+                         state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Report closed dependencies whose merge commit is not contained in the task base."""
+    stale: list[dict[str, Any]] = []
+    for item in state["items"]:
+        if item["status"] != "closed":
+            continue
+        event = conn.execute(
+            "SELECT detail_json FROM events WHERE entity_id=? AND action='task.close' "
+            "ORDER BY event_id DESC LIMIT 1", (item["task_id"],),
+        ).fetchone()
+        if not event:
+            continue
+        detail = load_state_json(event["detail_json"], f"events[{item['task_id']}].close.detail")
+        merge_commit = detail.get("merge_commit")
+        if not isinstance(merge_commit, str) or not merge_commit:
+            continue
+        if not git_ok(config, "merge-base", "--is-ancestor", merge_commit, row["base_commit"]):
+            stale.append({"task_id": item["task_id"], "merge_commit": merge_commit})
+    return stale
+
+
+def dependents_of(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT task_id,status,depends_on_json FROM tasks "
+        "WHERE status NOT IN ('closed','cancelled') AND task_id != ?", (task_id,),
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        dependencies = load_state_json(row["depends_on_json"], f"tasks[{row['task_id']}].depends_on")
+        if task_id in dependencies:
+            result.append({"task_id": row["task_id"], "status": row["status"]})
+    return result
+
+
+def evaluate_gates(gates: list[dict[str, Any]], results: Any, require_all: bool) -> list[dict[str, Any]]:
+    if not gates:
+        if results:
+            raise HubError("任务合同未声明 gates，但结果包含了 gate_results")
+        return []
+    if results is None:
+        if require_all:
+            raise HubError("任务声明了 gates，completed 提交必须提供 gate_results")
+        return []
+    if not isinstance(results, dict):
+        raise HubError("gate_results 必须是对象")
+    declared = {gate["id"]: gate for gate in gates}
+    unknown = sorted(set(results) - set(declared))
+    if unknown:
+        raise HubError(f"gate_results 含未声明的门禁: {unknown}")
+    missing = sorted(set(declared) - set(results))
+    if require_all and missing:
+        raise HubError(f"gate_results 缺少门禁: {missing}")
+    evaluated: list[dict[str, Any]] = []
+    for gate in gates:
+        if gate["id"] not in results:
+            continue
+        value = results[gate["id"]]
+        if not finite_number(value):
+            raise HubError(f"gate_results[{gate['id']}] 必须是有限数字")
+        evaluated.append({**gate, "value": value,
+                          "passed": bool(GATE_COMPARE[gate["operator"]](value, gate["threshold"]))})
+    return evaluated
+
+
+def verify_artifacts(config: dict[str, Any], artifacts: list[str], label: str) -> None:
+    if not artifacts:
+        return
+    root_value = config.get("execution", {}).get("artifact_root")
+    if not root_value:
+        raise HubError(f"{label}: 项目未配置 execution.artifact_root，无法校验 artifacts")
+    root = Path(root_value).expanduser().resolve()
+    missing: list[str] = []
+    escaped: list[str] = []
+    for relative in artifacts:
+        candidate = (root / relative).resolve()
+        if not candidate.is_relative_to(root):
+            escaped.append(relative)
+        elif not candidate.exists():
+            missing.append(relative)
+    if escaped or missing:
+        parts = []
+        if missing:
+            parts.append(f"缺失={missing}")
+        if escaped:
+            parts.append(f"越界={escaped}")
+        raise HubError(f"{label}: 交付物校验失败（artifact_root={root}）；" + "；".join(parts))
+
+
 def repository_snapshot(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "head": git(config, "rev-parse", "HEAD"),
@@ -644,15 +916,24 @@ def latest_review(conn: sqlite3.Connection, task_id: str) -> dict[str, Any] | No
 
 def task_summary(row: sqlite3.Row) -> dict[str, Any]:
     lease = lease_state(row)
-    return {
+    summary = {
         "id": row["task_id"], "title": row["title"], "priority": row["priority"],
         "status": row["status"], "assignee": row["assignee"],
         "decision_key": row["decision_key"], "claimed_by": row["claimed_by"],
         "active_device": row["active_device"], "claim_session": row["claim_session"],
         "claim_generation": row["claim_generation"], "lease_expired": lease["expired"],
-        "lease": lease,
+        "lease": lease, "chain_id": row["chain_id"],
+        "depends_on": load_state_json(row["depends_on_json"], f"tasks[{row['task_id']}].depends_on"),
+        "supersedes": row["supersedes"], "superseded_by": row["superseded_by"],
         "branch": row["branch"], "updated_at": row["updated_at"],
     }
+    if row["result_json"]:
+        result = load_state_json(row["result_json"], f"tasks[{row['task_id']}].result")
+        computed = result.get("gates") if isinstance(result, dict) else None
+        if isinstance(computed, list) and computed:
+            passed = sum(1 for gate in computed if isinstance(gate, dict) and gate.get("passed") is True)
+            summary["gate_status"] = {"total": len(computed), "passed": passed}
+    return summary
 
 
 def task_packet(conn: sqlite3.Connection, row: sqlite3.Row, config: dict[str, Any], session: str | None = None) -> dict[str, Any]:
@@ -670,6 +951,10 @@ def task_packet(conn: sqlite3.Connection, row: sqlite3.Row, config: dict[str, An
         "blocked_protocol": row["blocked_protocol"],
         "base_commit": row["base_commit"], "worktree_path": row["worktree_path"],
         "context_budget": row["context_budget"],
+        "gates": load_state_json(row["gates_json"], f"tasks[{row['task_id']}].gates"),
+        "artifacts": load_state_json(row["artifacts_json"], f"tasks[{row['task_id']}].artifacts"),
+        "allow_path_overlap": bool(row["allow_path_overlap"]),
+        "dependents": dependents_of(conn, row["task_id"]),
         "ownership": {
             "session": row["claim_session"],
             "mine": bool(session and row["claim_session"] == session),
@@ -678,6 +963,11 @@ def task_packet(conn: sqlite3.Connection, row: sqlite3.Row, config: dict[str, An
         "checkpoint": latest_checkpoint(conn, row["task_id"], generation),
         "latest_review": latest_review(conn, row["task_id"]),
     }
+    dependencies = dependency_state(conn, row)
+    dependencies["stale_base"] = dependency_freshness(conn, config, row, dependencies)
+    packet["dependencies"] = dependencies
+    if config.get("execution", {}).get("artifact_root"):
+        packet["artifact_root"] = config["execution"]["artifact_root"]
     older = previous_checkpoint(conn, row["task_id"], generation)
     if older:
         packet["previous_checkpoint"] = older
@@ -709,11 +999,17 @@ def submission_history(conn: sqlite3.Connection, task_id: str) -> list[dict[str,
     ]
 
 
-def do_status(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, all_tasks: bool, as_json: bool, mine: bool = False, assignee: str | None = None) -> None:
+def do_status(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, all_tasks: bool,
+              as_json: bool, mine: bool = False, assignee: str | None = None,
+              decision: str | None = None) -> None:
     identity(config, agent, device, "status")
     target = agent if mine else assignee
     if assignee is not None and assignee not in config["agents"]:
         raise HubError(f"未知 Agent: {assignee}")
+    if decision is not None and not conn.execute(
+        "SELECT 1 FROM decisions WHERE decision_key=?", (decision,)
+    ).fetchone():
+        raise HubError(f"未知决策: {decision}")
     clauses: list[str] = []
     params: list[Any] = []
     if not all_tasks:
@@ -721,6 +1017,9 @@ def do_status(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devi
     if target:
         clauses.append("assignee=?")
         params.append(target)
+    if decision is not None:
+        clauses.append("decision_key=?")
+        params.append(decision)
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     rows = conn.execute(
         f"SELECT * FROM tasks {where} ORDER BY priority ASC, created_at ASC, task_id ASC", params
@@ -728,15 +1027,37 @@ def do_status(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devi
     decisions = [dict(row) for row in conn.execute(
         "SELECT decision_key,summary,decided_by,updated_at FROM decisions ORDER BY updated_at DESC LIMIT 10"
     )]
-    result = {"project": config["project_id"], "version": VERSION, "repository": repository_snapshot(config), "filter": {"assignee": target}, "tasks": [task_summary(row) for row in rows], "decisions": decisions}
+    tasks: list[dict[str, Any]] = []
+    for row in rows:
+        summary = task_summary(row)
+        state = dependency_state(conn, row)
+        summary["dependency"] = {"satisfied": state["satisfied"], "unmet": state["unmet"]}
+        tasks.append(summary)
+    result = {
+        "project": config["project_id"], "version": VERSION,
+        "repository": repository_snapshot(config),
+        "filter": {"assignee": target, "decision": decision},
+        "tasks": tasks, "decisions": decisions,
+    }
     if as_json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     print(f"AgentHub {VERSION} | {config['project_id']} | 活动任务 {len(rows)}")
-    for row in rows:
+    for row, summary in zip(rows, tasks):
         session = f" session={row['claim_session']}" if row["claim_session"] else ""
         lease = " lease=expired" if lease_state(row)["expired"] else ""
-        print(f"- [{row['status']}] P{row['priority']} {row['task_id']} {row['title']} -> {row['claimed_by'] or '未认领'}{session}{lease}")
+        chain = f" chain={summary['chain_id']}" if summary["chain_id"] else ""
+        decision_value = f" decision={summary['decision_key']}"
+        dependencies = f" deps={','.join(summary['depends_on'])}" if summary["depends_on"] else ""
+        unmet = summary["dependency"]["unmet"]
+        blocked = f" blocked_by={','.join(item['task_id'] for item in unmet)}" if unmet else ""
+        gates = ""
+        if "gate_status" in summary:
+            gates = f" gates={summary['gate_status']['passed']}/{summary['gate_status']['total']}"
+        print(
+            f"- [{row['status']}] {row['task_id']} {row['title']} (P{row['priority']}){chain}{decision_value}"
+            f"{dependencies}{blocked}{gates} -> {row['claimed_by'] or '未认领'}{session}{lease}"
+        )
     if decisions:
         print("当前决策:")
         for item in decisions:
@@ -753,13 +1074,27 @@ def executor_task_row(
     skip every session-bound task; `required` projects only expose ready work. The skipped rows
     are returned so the caller can explain why an in-progress task is not shown.
     """
+    def dependency_exclusion(candidate: sqlite3.Row, state: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "task_id": candidate["task_id"], "session": candidate["claim_session"],
+            "status": candidate["status"], "reason": "dependencies_unmet",
+            "dependencies": state["unmet"],
+        }
+
     if available:
-        row = conn.execute(
+        rows = conn.execute(
             "SELECT * FROM tasks WHERE assignee=? AND status='ready' AND claimed_by IS NULL "
-            "ORDER BY priority,created_at,task_id LIMIT 1",
+            "ORDER BY priority,created_at,task_id",
             (agent,),
-        ).fetchone()
-        return row, []
+        ).fetchall()
+        excluded: list[dict[str, Any]] = []
+        for row in rows:
+            state = dependency_state(conn, row)
+            if not state["satisfied"]:
+                excluded.append(dependency_exclusion(row, state))
+                continue
+            return row, excluded[:10]
+        return None, excluded[:10]
     if session:
         row = conn.execute(
             "SELECT * FROM tasks WHERE assignee=? AND claim_session=? "
@@ -770,12 +1105,19 @@ def executor_task_row(
         ).fetchone()
         if row:
             return row, []
-        row = conn.execute(
+        rows = conn.execute(
             "SELECT * FROM tasks WHERE assignee=? AND status='ready' AND claimed_by IS NULL "
-            "ORDER BY priority,created_at,task_id LIMIT 1",
+            "ORDER BY priority,created_at,task_id",
             (agent,),
-        ).fetchone()
-        return row, []
+        ).fetchall()
+        excluded = []
+        for row in rows:
+            state = dependency_state(conn, row)
+            if not state["satisfied"]:
+                excluded.append(dependency_exclusion(row, state))
+                continue
+            return row, excluded[:10]
+        return None, excluded[:10]
     rows = conn.execute(
         "SELECT * FROM tasks WHERE assignee=? AND status IN ('in_progress','blocked','review','ready') "
         "AND status != 'cancelled' "
@@ -783,7 +1125,7 @@ def executor_task_row(
         "priority,created_at,task_id",
         (agent,),
     ).fetchall()
-    excluded: list[dict[str, Any]] = []
+    excluded = []
     required = session_policy(config) == "required"
     for row in rows:
         if row["claim_session"]:
@@ -798,6 +1140,11 @@ def executor_task_row(
                 "status": row["status"], "reason": "session_required",
             })
             continue
+        if row["status"] == "ready":
+            state = dependency_state(conn, row)
+            if not state["satisfied"]:
+                excluded.append(dependency_exclusion(row, state))
+                continue
         return row, excluded[:10]
     return None, excluded[:10]
 
@@ -917,6 +1264,14 @@ def validate_task_contract(config: dict[str, Any], raw: str) -> dict[str, Any]:
     deliverables = required_list(spec, "deliverables")
     evidence_requirements = required_list(spec, "evidence_requirements")
     blocked_protocol = required_text(spec, "blocked_protocol", 1000)
+    depends_on = validate_depends_on(spec, task_id)
+    gates = validate_gates(spec)
+    artifacts = validate_artifacts(spec)
+    if artifacts and not config.get("execution", {}).get("artifact_root"):
+        raise HubError("任务声明了 artifacts，但项目未配置 execution.artifact_root")
+    allow_path_overlap = spec.get("allow_path_overlap", False)
+    if not isinstance(allow_path_overlap, bool):
+        raise HubError("allow_path_overlap 必须是布尔值")
     priority = spec.get("priority", 50)
     if type(priority) is not int or not 1 <= priority <= 99:
         raise HubError("priority 必须是 1..99 的整数")
@@ -964,12 +1319,15 @@ def validate_task_contract(config: dict[str, Any], raw: str) -> dict[str, Any]:
         "allowed_paths": allowed_paths, "forbidden_paths": forbidden_paths,
         "acceptance": acceptance, "validation": validation, "deliverables": deliverables,
         "evidence_requirements": evidence_requirements, "blocked_protocol": blocked_protocol,
+        "depends_on": depends_on, "gates": gates, "artifacts": artifacts,
+        "allow_path_overlap": allow_path_overlap,
         "priority": priority, "context_budget": context_budget,
         "branch": branch, "worktree_path": worktree_path,
     }
 
 
-def check_task_constraints(conn: sqlite3.Connection, config: dict[str, Any], spec: dict[str, Any], replacing: str | None = None) -> None:
+def check_task_constraints(conn: sqlite3.Connection, config: dict[str, Any], spec: dict[str, Any],
+                           replacing: str | None = None) -> list[dict[str, Any]]:
     task_id, chain_id = spec["id"], spec["chain_id"]
     if conn.execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone():
         raise HubError(f"任务 ID 已存在: {task_id}")
@@ -994,11 +1352,49 @@ def check_task_constraints(conn: sqlite3.Connection, config: dict[str, Any], spe
             raise HubError(f"下一可用序号应为 {expected:0{naming['seq_digits']}d}，但收到 {candidate:0{naming['seq_digits']}d}")
     if not conn.execute("SELECT 1 FROM decisions WHERE decision_key=?", (spec["decision_key"],)).fetchone():
         raise HubError(f"任务必须关联已存在的决策: {spec['decision_key']}")
+    if replacing and replacing in spec["depends_on"]:
+        raise HubError(f"新合同不能依赖正在被替代的任务 {replacing}")
+    for dependency in spec["depends_on"]:
+        row = conn.execute("SELECT status FROM tasks WHERE task_id=?", (dependency,)).fetchone()
+        if not row:
+            raise HubError(f"depends_on 引用了不存在的任务: {dependency}")
+        if row["status"] == "cancelled":
+            raise HubError(f"depends_on 引用已取消的任务: {dependency}")
     git(config, "rev-parse", "--verify", f"{spec['base_commit']}^{{commit}}")
+    closure = dependency_closure(conn, spec["depends_on"])
+    active = conn.execute(
+        "SELECT task_id,chain_id,allowed_paths_json FROM tasks "
+        "WHERE status NOT IN ('closed','cancelled') AND task_id != ?",
+        (replacing or "",),
+    ).fetchall()
+    acknowledgements: list[dict[str, Any]] = []
+    for other in active:
+        if other["task_id"] in closure:
+            continue
+        if spec["chain_id"] and other["chain_id"] == spec["chain_id"]:
+            continue
+        other_paths = load_state_json(other["allowed_paths_json"], f"tasks[{other['task_id']}].allowed_paths")
+        overlaps = [
+            {"path": left, "other_path": right}
+            for left in spec["allowed_paths"]
+            for right in other_paths
+            if path_patterns_overlap(left, right)
+        ]
+        if not overlaps:
+            continue
+        if not spec["allow_path_overlap"]:
+            detail = ", ".join(f"{item['path']} ↔ {item['other_path']}" for item in overlaps[:3])
+            raise HubError(
+                f"任务 {spec['id']} 的 allowed_paths 与活动任务 {other['task_id']} 重叠: {detail}；"
+                "如需并发请声明 depends_on，或在合同中显式设置 allow_path_overlap: true"
+            )
+        acknowledgements.append({"task_id": other["task_id"], "overlaps": overlaps})
+    return acknowledgements
 
 
-def insert_task(conn: sqlite3.Connection, config: dict[str, Any], agent: str, spec: dict[str, Any], stamp: str, supersedes: str | None = None) -> None:
-    check_task_constraints(conn, config, spec, replacing=supersedes)
+def insert_task(conn: sqlite3.Connection, config: dict[str, Any], agent: str, spec: dict[str, Any],
+                stamp: str, supersedes: str | None = None) -> list[dict[str, Any]]:
+    acknowledgements = check_task_constraints(conn, config, spec, replacing=supersedes)
     values = {
         "task_id": spec["id"], "title": spec["title"], "objective": spec["objective"],
         "priority": spec["priority"], "assignee": spec["assignee"],
@@ -1007,27 +1403,37 @@ def insert_task(conn: sqlite3.Connection, config: dict[str, Any], agent: str, sp
         "blocked_protocol": spec["blocked_protocol"], "context_budget": spec["context_budget"],
         "status": "ready", "created_by": agent, "created_at": stamp, "updated_at": stamp,
         "chain_id": spec["chain_id"], "supersedes": supersedes,
+        "depends_on_json": json_dump(spec["depends_on"]),
+        "gates_json": json_dump(spec["gates"]),
+        "artifacts_json": json_dump(spec["artifacts"]),
+        "allow_path_overlap": 1 if spec["allow_path_overlap"] else 0,
     }
     values.update({field + "_json": json_dump(spec[field]) for field in TASK_LIST_FIELDS})
     columns = ",".join(values)
     placeholders = ",".join("?" for _ in values)
     conn.execute(f"INSERT INTO tasks({columns}) VALUES({placeholders})", tuple(values.values()))
+    return acknowledgements
 
 
 def do_post(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, raw: str) -> None:
     identity(config, agent, device, "post")
     spec = validate_task_contract(config, raw)
+    acknowledgements: list[dict[str, Any]] = []
     conn.execute("BEGIN IMMEDIATE")
     try:
-        insert_task(conn, config, agent, spec, now())
-        record(conn, agent, device, "task.post", spec["id"], {
-            key: spec[key] for key in ("title", "priority", "assignee", "decision_key", "base_commit")
-        })
+        acknowledgements = insert_task(conn, config, agent, spec, now())
+        detail = {key: spec[key] for key in ("title", "priority", "assignee", "decision_key", "base_commit")}
+        if acknowledgements:
+            detail["path_overlap_ack"] = acknowledgements
+        record(conn, agent, device, "task.post", spec["id"], detail)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     print(f"已发布 {spec['id']}")
+    if acknowledgements:
+        print(json.dumps({"task_id": spec["id"], "path_overlap_ack": acknowledgements},
+                         ensure_ascii=False), file=sys.stderr)
 
 
 def load_task(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
@@ -1064,6 +1470,10 @@ def claim_task(conn: sqlite3.Connection, config: dict[str, Any], agent: str, dev
         raise HubError(f"任务 {task_id} 当前不可认领: {row['status']}")
     if session_policy(config) == "required" and not session:
         raise HubError("execution.session_policy=required：claim/claim-next 必须带 --session <id>")
+    dependencies = dependency_state(conn, row)
+    if not dependencies["satisfied"]:
+        detail = ", ".join(f"{item['task_id']}({item['status']})" for item in dependencies["unmet"])
+        raise HubError(f"任务 {task_id} 的依赖尚未全部 closed: {detail}")
     seconds = lease_seconds_argument(lease_minutes)
     ensure_capacity(conn, config, agent)
     ensure_worktree(config, row)
@@ -1081,7 +1491,12 @@ def claim_task(conn: sqlite3.Connection, config: dict[str, Any], agent: str, dev
     # Read the packet inside the transaction: it is the first thing that touches the new
     # worktree with git, and a failure there must leave the task claimable rather than
     # committed as in_progress with nobody able to reach it.
-    return task_packet(conn, updated, config, session)
+    packet = task_packet(conn, updated, config, session)
+    stale = packet.get("dependencies", {}).get("stale_base", [])
+    if stale:
+        print(json.dumps({"task_id": task_id, "warning": "base_commit 不包含依赖的合并提交", "stale_base": stale},
+                         ensure_ascii=False), file=sys.stderr)
+    return packet
 
 
 def do_claim(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, task_id: str,
@@ -1103,20 +1518,29 @@ def do_claim_next(conn: sqlite3.Connection, config: dict[str, Any], agent: str, 
     identity(config, agent, device, "claim")
     if session_policy(config) == "required" and not session:
         raise HubError("execution.session_policy=required：claim/claim-next 必须带 --session <id>")
+    packet: dict[str, Any] | None = None
+    skipped: list[dict[str, Any]] = []
     conn.execute("BEGIN IMMEDIATE")
     try:
-        row = conn.execute(
+        rows = conn.execute(
             "SELECT * FROM tasks WHERE assignee=? AND status='ready' AND claimed_by IS NULL "
-            "ORDER BY priority,created_at,task_id LIMIT 1",
+            "ORDER BY priority,created_at,task_id",
             (agent,),
-        ).fetchone()
-        packet = claim_task(conn, config, agent, device, row, session, lease_minutes) if row else None
+        ).fetchall()
+        for row in rows:
+            state = dependency_state(conn, row)
+            if not state["satisfied"]:
+                skipped.append({"task_id": row["task_id"], "reason": "dependencies_unmet",
+                                "dependencies": state["unmet"]})
+                continue
+            packet = claim_task(conn, config, agent, device, row, session, lease_minutes)
+            break
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     print(json.dumps({
-        "task": packet,
+        "task": packet, "skipped": skipped,
         "concurrency": {"active": len(active_task_ids(conn, agent)), "limit": task_limit(config, agent)},
         "session": session,
     }, ensure_ascii=False, indent=2))
@@ -1315,6 +1739,8 @@ def do_submit(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devi
     if outcome not in {"completed", "blocked"}:
         raise HubError("outcome 仅允许 completed 或 blocked")
     required_text(result, "summary")
+    if "gates" in result:
+        raise HubError("gates 是核心计算字段；请在 gate_results 中提供实测值")
     if outcome == "completed":
         required_list(result, "evidence")
         required_list(result, "tests")
@@ -1333,6 +1759,21 @@ def do_submit(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devi
         if row["active_device"] != device:
             raise HubError(f"任务活动设备是 {row['active_device']}；请先从活动设备执行 handoff")
         require_session(config, row, session, "submit")
+        gate_definitions = load_state_json(row["gates_json"], f"tasks[{task_id}].gates")
+        evaluated = evaluate_gates(gate_definitions, result.get("gate_results"),
+                                   require_all=(outcome == "completed"))
+        if outcome == "completed":
+            failed = [gate for gate in evaluated if not gate["passed"]]
+            if failed:
+                detail = "; ".join(
+                    f"{gate['id']} ({gate['metric']}): {gate['value']} {gate['operator']} {gate['threshold']}"
+                    for gate in failed
+                )
+                raise HubError(
+                    f"合同门禁未通过: {detail}；请核对测量口径，或改用 blocked 提交并把实测值与取舍交回决策者"
+                )
+        if evaluated:
+            result["gates"] = evaluated
         if outcome == "completed":
             worktree = row["worktree_path"]
             branch = git(config, "branch", "--show-current", cwd=worktree)
@@ -1353,6 +1794,8 @@ def do_submit(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devi
             denied = [path for path in changed if any(fnmatch.fnmatch(path, pattern) for pattern in forbidden)]
             if outside or denied:
                 raise HubError(f"提交文件超出合同路径边界；未授权={outside}；禁止={denied}")
+            verify_artifacts(config, load_state_json(row["artifacts_json"], f"tasks[{task_id}].artifacts"),
+                             f"任务 {task_id}")
         stamp = now()
         conn.execute(
             "INSERT INTO submissions(task_id,agent_id,device,outcome,result_json,created_at) VALUES(?,?,?,?,?,?)",
@@ -1382,6 +1825,19 @@ def do_review(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devi
         if action == "approve":
             if row["status"] != "review":
                 raise HubError("只有 review 状态可以批准")
+            gate_definitions = load_state_json(row["gates_json"], f"tasks[{task_id}].gates")
+            if gate_definitions:
+                if not row["result_json"]:
+                    raise HubError("review 任务缺少执行结果，不能批准")
+                submitted = load_state_json(row["result_json"], f"tasks[{task_id}].result")
+                evaluated = evaluate_gates(gate_definitions, submitted.get("gate_results"), require_all=True)
+                failed = [gate for gate in evaluated if not gate["passed"]]
+                if failed:
+                    detail = "; ".join(
+                        f"{gate['id']} ({gate['metric']}): {gate['value']} {gate['operator']} {gate['threshold']}"
+                        for gate in failed
+                    )
+                    raise HubError(f"合同门禁未通过，不能批准: {detail}")
             target, claimed_by, active_device = "approved", row["claimed_by"], row["active_device"]
             claim_session = row["claim_session"]
         elif action == "rework":
@@ -1428,6 +1884,8 @@ def do_close(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devic
             raise HubError(f"merge_commit 必须是目标分支 {target_branch} 的当前 HEAD")
         if not git_ok(config, "merge-base", "--is-ancestor", task_commit, merge_commit):
             raise HubError("目标分支尚未包含已批准的任务 commit")
+        artifacts = load_state_json(row["artifacts_json"], f"tasks[{task_id}].artifacts")
+        verify_artifacts(config, artifacts, f"任务 {task_id}")
         worktree = Path(row["worktree_path"])
         if worktree.exists():
             if git(config, "status", "--porcelain", cwd=str(worktree)):
@@ -1447,10 +1905,13 @@ def do_close(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devic
         )
         if cursor.rowcount != 1:
             raise HubError("任务状态已被其他命令改变，关闭失败")
-        record(conn, agent, device, "task.close", task_id, {
+        detail = {
             "task_commit": task_commit, "merge_commit": merge_commit,
             "target_branch": target_branch, "session": row["claim_session"], "note": note.strip(),
-        })
+        }
+        if artifacts:
+            detail["artifacts"] = artifacts
+        record(conn, agent, device, "task.close", task_id, detail)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1473,7 +1934,6 @@ def do_close(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devic
         print(json.dumps({"task_id": task_id, "cleanup": "pending", "errors": cleanup_errors,
                           "hint": "run prune --apply after the cause is fixed"}, ensure_ascii=False),
               file=sys.stderr)
-    print(f"已关闭 {task_id}；目标 {target_branch}@{merge_commit}")
     print(f"已关闭 {task_id}；目标 {target_branch}@{merge_commit}")
 
 
@@ -1510,6 +1970,10 @@ def do_cancel(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devi
         conn.rollback()
         raise
     print(f"已取消 {task_id}")
+    dependents = dependents_of(conn, task_id)
+    if dependents:
+        print(json.dumps({"task_id": task_id, "warning": "仍有活动任务依赖该任务，取消后它们无法 claim",
+                          "dependents": dependents}, ensure_ascii=False), file=sys.stderr)
 
 
 def parse_worktree_listing(text: str) -> list[dict[str, Any]]:
@@ -1595,6 +2059,7 @@ def do_supersede(conn: sqlite3.Connection, config: dict[str, Any], agent: str, d
         raise HubError("替代原因不能为空")
     spec = validate_task_contract(config, new_spec)
     new_id = spec["id"]
+    acknowledgements: list[dict[str, Any]] = []
     conn.execute("BEGIN IMMEDIATE")
     try:
         old_row = load_task(conn, task_id)
@@ -1603,8 +2068,11 @@ def do_supersede(conn: sqlite3.Connection, config: dict[str, Any], agent: str, d
         if old_row["superseded_by"]:
             raise HubError(f"任务 {task_id} 已被 {old_row['superseded_by']} 替代")
         stamp = now()
-        insert_task(conn, config, agent, spec, stamp, supersedes=task_id)
-        record(conn, agent, device, "task.supersede.new_posted", task_id, {"new_task": new_id, "reason": reason.strip()})
+        acknowledgements = insert_task(conn, config, agent, spec, stamp, supersedes=task_id)
+        detail = {"new_task": new_id, "reason": reason.strip()}
+        if acknowledgements:
+            detail["path_overlap_ack"] = acknowledgements
+        record(conn, agent, device, "task.supersede.new_posted", task_id, detail)
         conn.execute(
             "UPDATE tasks SET status='cancelled',claimed_by=NULL,active_device=NULL,claim_session=NULL,"
             "last_heartbeat_at=NULL,lease_seconds=0,cancelled_at=?,cancelled_by=?,cancel_reason=?,superseded_by=?,updated_at=? "
@@ -1619,6 +2087,13 @@ def do_supersede(conn: sqlite3.Connection, config: dict[str, Any], agent: str, d
         conn.rollback()
         raise
     print(f"已替代 {task_id} -> {new_id}")
+    if acknowledgements:
+        print(json.dumps({"task_id": new_id, "path_overlap_ack": acknowledgements},
+                         ensure_ascii=False), file=sys.stderr)
+    dependents = dependents_of(conn, task_id)
+    if dependents:
+        print(json.dumps({"task_id": task_id, "warning": "仍有活动任务依赖被替代的任务，需要一并 supersede",
+                          "dependents": dependents}, ensure_ascii=False), file=sys.stderr)
 
 
 def do_decision(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, key: str, summary: str, rationale: str) -> None:
@@ -1668,6 +2143,7 @@ def parser() -> argparse.ArgumentParser:
     init = subs.add_parser("init"); init.add_argument("agent")
     status = subs.add_parser("status"); status.add_argument("agent"); status.add_argument("--all", action="store_true"); status.add_argument("--json", action="store_true")
     status_filter = status.add_mutually_exclusive_group(); status_filter.add_argument("--mine", action="store_true"); status_filter.add_argument("--assignee")
+    status.add_argument("--decision")
     context = subs.add_parser("context"); context.add_argument("agent")
     next_task = subs.add_parser("next"); next_task.add_argument("agent"); next_task.add_argument("--available", action="store_true")
     show = subs.add_parser("show"); show.add_argument("agent"); show.add_argument("task_id")
@@ -1736,7 +2212,7 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "init":
             identity(config, args.agent, device, "init")
             print(f"AgentHub {VERSION} initialized: {state}")
-        elif args.command == "status": do_status(conn, config, args.agent, device, args.all, args.json, args.mine, args.assignee)
+        elif args.command == "status": do_status(conn, config, args.agent, device, args.all, args.json, args.mine, args.assignee, args.decision)
         elif args.command == "context": do_context(conn, config, args.agent, device, session)
         elif args.command == "next": do_next(conn, config, args.agent, device, session, args.available)
         elif args.command == "show": do_show(conn, config, args.agent, device, args.task_id, session)

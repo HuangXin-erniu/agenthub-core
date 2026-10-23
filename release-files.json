@@ -25,6 +25,7 @@
   "templates/project.example.json",
   "tests/test_agenthub.py",
   "tests/test_concurrency.py",
+  "tests/test_contract_extensions.py",
   "tests/test_integrity.py",
   "tests/test_publication.py",
   "tests/test_sessions.py",

@@ -1,4 +1,4 @@
-# AgentHub Core 2.4.1
+# AgentHub Core 2.4.2
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -58,7 +58,7 @@ python agent_hub.py --project <project_id> --device <device_id> next <executor_a
 python agent_hub.py --project <project_id> --device <device_id> --session <window_id> next <executor_agent_id> --available
 ```
 
-For a local authority with an explicit private configuration, use `--local --config <config_file>`. Always declare the executing device. Version 2.4.1 retains the 2.3.1 CLI parameters and configuration format; `next --available`, `claim-next`, `release`, `--session` and `heartbeat` are additive.
+For a local authority with an explicit private configuration, use `--local --config <config_file>`. Always declare the executing device. Version 2.4.2 retains the 2.3.1 CLI parameters and configuration format; `next --available`, `claim-next`, `release`, `--session`, `heartbeat`, `status --decision`, and the contract fields `depends_on`, `gates`, `artifacts` and `allow_path_overlap` are additive.
 
 | Commands | Purpose |
 | --- | --- |
@@ -74,6 +74,9 @@ Each subcommand supports `--help`. JSON arguments accept inline JSON or `@<file>
 ## Workflow integrity and routing
 
 - **Contracts:** `post` and `supersede` apply the same required fields, array, priority, budget, naming, decision and commit checks. Sequence numbers are global within a project, include cancelled tasks and cannot be reused. A replacement can retain its old task's chain ID, but cannot conflict with another active task. Replacement and cancellation commit atomically.
+- **Dependencies:** an optional `depends_on` array names earlier tasks that must be `closed` before the task can be claimed. `claim`, `claim-next`, `next` and `next --available` refuse or skip unsatisfied tasks and report which dependency is unmet. The packet also warns when a closed dependency's merge commit is not contained in the task's `base_commit`, so the executor can merge the target branch or the decider can supersede with a newer base. `chain_id` remains a lineage label, not an ordering mechanism.
+- **Path conflicts:** `post` compares the new contract's `allowed_paths` with every active task. Overlapping patterns are rejected unless the tasks are serialized by `depends_on` or the contract sets `allow_path_overlap: true`; an explicit acknowledgement is recorded in the `task.post` event. Glob patterns are compared by their static prefix, which is deliberately conservative.
+- **Gates and artifacts:** a contract may declare numeric `gates` (`id`, `metric`, `operator` in `>= > <= <`, `threshold`, optional `source`). A completed submission must supply `gate_results` for every declared gate; the runtime computes pass/fail, rejects a completed submission when a required gate fails (use `blocked` to return the measurement and the trade-off to the decider), and recomputes the gates on `review approve`. A project may set `execution.artifact_root`, and a contract may then declare `artifacts` as paths relative to it; `submit` and `close` verify that every declared artifact exists, and `close` refuses before deleting the worktree.
 - **Routing:** with remote access enabled, a registered device other than `state_authority.host` proxies through SSH on Windows and POSIX alike. The Authority, disabled remote access and explicit `--local` use local execution. SSH errors do not fall back to a local database.
 - **Handoff:** the current executor must save a checkpoint on the active device after the most recent claim or handoff. A different administrator can recover an unavailable device through the existing handoff command with a non-empty explanation; recovery records whether a valid checkpoint was missing. Event IDs determine order, including events occurring in the same second.
 - **Paths:** submission checks every changed path; a rename checks both source and destination. Forbidden patterns take precedence. NUL-separated Git output preserves Unicode, spaces and supported special filenames; paths that cannot be decoded reliably as UTF-8 are rejected. Existing `fnmatch` semantics remain: `src/*` also matches `src/nested/file.py`, and case normalization follows the host OS.
@@ -104,16 +107,18 @@ Deployment replaces managed files one by one, so it is not a transaction across 
 
 Messaging transports are disabled. Legacy Feishu/Lark implementations are omitted. Agent identities and role checks organize trusted workflow; they do not authenticate untrusted network users.
 
-## Upgrade from 2.4.0 or earlier
+## Upgrade from 2.4.1 or earlier
 
 1. Pause Authority commands and back up its SQLite state using an SQLite-aware backup or a stopped Authority. Nothing else needs to be kept aside for rollback: a deployment retains the generation it replaces, and `--rollback` restores it.
-2. Review the [changelog](CHANGELOG.md), install the 2.4.1 runtime and update your private configuration's `agenthub_version` to `2.4.1` so the structural audit agrees with the runtime.
-3. Configuration schema remains **1** and database schema remains **4**. The new session, heartbeat and claim-generation columns are added in place; existing task and checkpoint history is preserved. Older runtimes ignore the new columns.
+2. Review the [changelog](CHANGELOG.md), install the 2.4.2 runtime and update your private configuration's `agenthub_version` to `2.4.2` so the structural audit agrees with the runtime.
+3. Configuration schema remains **1** and database schema remains **4**. The session, heartbeat and claim-generation columns, plus the new `depends_on_json`, `gates_json`, `artifacts_json` and `allow_path_overlap` columns, are added in place; existing task and checkpoint history is preserved. Older runtimes ignore the new columns. Existing contracts without the new optional fields behave as before.
 4. Configurations without `execution.session_policy` keep `optional`: session-less commands behave as before, and legacy unbound claims remain visible. To isolate long tasks from other windows, set it to `required`, then bind each running claim once with `heartbeat --session <id>`. A bound claim accepts only its own session; an administrator may bind an unbound claim on the executor's behalf.
 5. Long tasks may stay in flight across the deploy: deployment never touches SQLite state and `tests/test_upgrade.py` covers the runtime swap. Do not use `--require-idle` for that upgrade. After the deploy, bind the running claim before its next checkpoint or submit.
 6. To enable concurrent tasks for one executor, set `execution.concurrency` to `multiple_tasks_per_executor` and `execution.max_active_tasks_per_executor` to a value from 1 to 32. Optionally lower an individual executor's limit with `agents.<id>.max_active_tasks`.
 7. Save a current checkpoint before ordinary handoff. Previously accepted incomplete replacement contracts, repeated sequences and renames involving forbidden paths are rejected. Historical contracts are not rewritten.
 8. Run the structural audit, tests and isolated smoke check; validate the real launcher under your deployment process before resuming tasks.
+
+For 2.4.2, review active contracts before posting new ones: `allowed_paths` now conflicts with other active tasks at `post` time, so a batch of contracts sharing a prefix must be sequenced with `depends_on` or acknowledged with `allow_path_overlap: true`. Set `execution.artifact_root` only if contracts will declare `artifacts`. Gate declarations are optional and only affect contracts that use them.
 
 This public release does not deploy or modify any existing private project automatically.
 
