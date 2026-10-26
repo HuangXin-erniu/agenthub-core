@@ -9,6 +9,17 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# Local tool and OS metadata is not part of a project registration. Ignoring it keeps the
+# mirror check focused on real files while still flagging every other undeclared entry.
+IGNORED_PROJECT_DIRS = {".git", ".zcode", "__pycache__"}
+IGNORED_PROJECT_FILES = {".DS_Store"}
+IGNORED_PROJECT_SUFFIXES = {".pyc"}
+
+
+def ignored_project_artifact(relative: Path) -> bool:
+    if any(part in IGNORED_PROJECT_DIRS for part in relative.parts[:-1]):
+        return True
+    return relative.name in IGNORED_PROJECT_FILES or relative.suffix in IGNORED_PROJECT_SUFFIXES
 
 
 def instruction_files(value: object) -> set[str]:
@@ -201,7 +212,12 @@ def audit(root: Path = ROOT) -> dict:
             if not target.is_relative_to(project_dir) or not target.is_file():
                 findings.append(f"instructions:missing-or-outside:{label}")
         for target in project_dir.rglob("*"):
-            if target.is_file() and target.relative_to(project_dir).as_posix() not in required:
+            if not target.is_file():
+                continue
+            relative = target.relative_to(project_dir)
+            if ignored_project_artifact(relative):
+                continue
+            if relative.as_posix() not in required:
                 findings.append(f"mirror:unexpected:{target.relative_to(root).as_posix()}")
         identities.update([project_id, *(agent for agent in config["agents"] if agent not in hub.PERMISSIONS)])
         identities.update(str(value) for value in (config["execution"]["repository"], config["execution"]["worktree_root"], config["state_authority"]["database"]))

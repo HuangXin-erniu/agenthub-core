@@ -13,6 +13,7 @@
 - `show` no longer treats an Agent that is both executor and reviewer as an executor-only identity. The restriction to assigned tasks now applies only when the Agent has `executor` and no `decider`/`administrator` role.
 - `close` clears `claimed_by` and preserves the executor in the `task.close` event, matching the invariant that a terminal task has no current claimant.
 - Configuration validation rejects non-array or empty-string `roles`/`devices`, an invalid `self_review` value, and a `self_review` key on an Agent without both an execution and a review role, instead of failing later with a misleading error or silently ignoring the policy.
+- The structural audit ignores local tool and OS metadata under a private registration (`.zcode`, `.git`, `__pycache__`, `.DS_Store` and `*.pyc`) instead of reporting it as an unexpected mirror. Every other undeclared file is still rejected, so real business-code mirrors remain visible.
 - Removed the project-specific `Codex` wording from the core `context` payload and the control-plane operating standard; core text is now role-neutral.
 
 ### Changed

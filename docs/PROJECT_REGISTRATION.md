@@ -31,6 +31,8 @@ No concrete value from one registration may appear in core source or another reg
 10. Deploy with `python3 scripts/deploy_project.py --project <project_id>` without resetting state.
 11. Run the authority-host smoke test before production tasks. It uses a temporary clone, state and worktree and does not invoke the private launcher. Validate the actual launcher separately under your change process.
 
+The mirror check ignores local tool and OS metadata under the registration directory: `.zcode`, `.git`, `__pycache__`, `.DS_Store` and `*.pyc`. Every other undeclared file is reported as `mirror:unexpected`, so a business-code copy cannot hide behind the ignore list.
+
 ## Concurrency
 
 `execution.concurrency` defaults to `one_active_task_per_executor`. Set it to `multiple_tasks_per_executor` and declare `execution.max_active_tasks_per_executor` (1-32) to let one executor hold several in-progress tasks. An optional `agents.<id>.max_active_tasks` lowers the limit for one executor and may not exceed the project value. Only `in_progress` tasks count toward the limit; `blocked` and `review` tasks do not.

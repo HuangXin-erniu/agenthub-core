@@ -74,6 +74,22 @@ class PublicationTests(unittest.TestCase):
             result = audit.audit(root)
             self.assertTrue(result["ok"], result["findings"])
             self.assertEqual(result["projects"], 1)
+
+            (project / ".zcode" / "plans").mkdir(parents=True)
+            (project / ".zcode" / "plans" / "plan.md").write_text("local plan")
+            (project / "__pycache__").mkdir()
+            (project / "__pycache__" / "cache.pyc").write_bytes(b"cache")
+            (project / ".DS_Store").write_bytes(b"metadata")
+            result = audit.audit(root)
+            self.assertTrue(result["ok"], result["findings"])
+
+            (project / "unexpected.md").write_text("real mirror")
+            result = audit.audit(root)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["findings"],
+                             ["mirror:unexpected:projects/audit_project/unexpected.md"])
+            (project / "unexpected.md").unlink()
+
             template_path = root / "templates/project.example.json"
             template = json.loads(template_path.read_text())
             template["messaging_transports"] = ["unreviewed"]
