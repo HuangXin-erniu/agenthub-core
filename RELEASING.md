@@ -65,6 +65,7 @@ The public history starts at 2.3.1. Versions before it are not in this repositor
 | v2.4.0 | 5c643f9 | tagged at release time |
 | v2.4.1 | 271a736 | tagged at release time |
 | v2.4.2 | 19d404c | tagged at release time |
+| v2.4.3 | e35b6c5 | tagged at release time |
 
 ## Deployment is separate
 
