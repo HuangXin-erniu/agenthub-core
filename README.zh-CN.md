@@ -1,4 +1,4 @@
-# AgentHub Core 2.4.2
+# AgentHub Core 2.4.3
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -31,6 +31,8 @@ AgentHub 核心：生命周期、角色权限、合同校验、SQLite schema
 | decider | 记录决策、发布任务合同、检查任务和复核证据 |
 | executor | 认领已分配任务、保存 checkpoint、交接设备和提交结果 |
 
+角色可以叠加。同一 Agent 可同时具备 `decider` 与 `executor`（也可再加 `administrator`），并共用一份统一的 `context`：`role_mode` 为 `hybrid`，`tasks` 是当前执行焦点，`overview` 列出活动任务，`review_queue` 列出 `blocked`/`review` 任务并带 `self_review` 标记。同时具备复核能力的执行者可以批准自己的提交，复核事件和任务包会记录 `self_review: true`；设置 `agents.<id>.self_review: forbid` 可要求独立复核者，该键仅对同时具备执行角色和复核角色的 Agent 有效。只有具备 `executor` 且没有复核角色的 Agent，`show` 才限制为只能查看分配给自己的任务。
+
 ```text
 decision -> post -> claim -> checkpoint / handoff -> submit -> review
                                                            | rework -> claim
@@ -58,7 +60,7 @@ python agent_hub.py --project <project_id> --device <device_id> next <executor_a
 python agent_hub.py --project <project_id> --device <device_id> --session <window_id> next <executor_agent_id> --available
 ```
 
-在本地权威主机使用显式私有配置时，采用 `--local --config <config_file>`。始终声明执行设备。2.4.2 保留 2.3.1 的 CLI 参数与配置格式；`next --available`、`claim-next`、`release`、`--session`、`heartbeat`、`status --decision`，以及合同字段 `depends_on`、`gates`、`artifacts`、`allow_path_overlap` 都是新增能力。
+在本地权威主机使用显式私有配置时，采用 `--local --config <config_file>`。始终声明执行设备。2.4.3 保留 2.3.1 的 CLI 参数与配置格式；`next --available`、`claim-next`、`release`、`--session`、`heartbeat`、`status --decision`，合同字段 `depends_on`、`gates`、`artifacts`、`allow_path_overlap`，可选的 `agents.<id>.self_review` 策略，以及 `context` 新增的 `role_mode`、`overview`、`review_queue` 字段都受支持。
 
 | 命令 | 用途 |
 | --- | --- |
@@ -82,6 +84,7 @@ python agent_hub.py --project <project_id> --device <device_id> --session <windo
 - **路径边界**：提交时检查全部变更路径，重命名同时检查源路径和目标路径。禁止规则优先。以 NUL 分隔的 Git 输出保留 Unicode、空格及平台支持的特殊文件名；无法可靠解码为 UTF-8 的路径会被拒绝。保留现有 `fnmatch` 语义：`src/*` 也匹配 `src/nested/file.py`，大小写规范化遵循主机操作系统。
 - **并发任务**：每个任务保留独立的 worktree、分支和活动设备。执行者默认同时只推进一个任务；项目可以启用 `multiple_tasks_per_executor`，并通过 `max_active_tasks_per_executor` 限定上限，也可按执行者下调。`next --session <id> --available` 列出未被认领的任务，`claim-next` 原子领取，`release` 把卡住的任务退回 `ready` 且不删除 worktree。只有 `in_progress` 任务占用并发名额。
 - **会话与长任务**：认领时记录发起窗口。`checkpoint`、`submit`、`handoff` 和 `release` 会拒绝同一执行者身份的其他窗口。设置 `execution.session_policy: required` 后，认领必须带 session，已有的未绑定任务需先用 `heartbeat --session <id>` 绑定一次。带 session 的 `next`/`context` 只显示本窗口的任务和未认领的 ready 任务；不带 session 时跳过并列出其他窗口的任务（`excluded`）。租约只是告警：`status`/`next` 报告 `lease_expired`，但永不自动释放。数据集、运行产物等外部共享状态仍由项目自身约定；session 隔离的是工作流所有权，不是文件写入。
+- **双角色与自审**：同时具备决策和执行角色的 Agent 会得到一份统一的 `context` 工作台，而不是只能在决策视图和执行视图之间二选一。执行焦点仍按声明的 session 隔离，`overview` 与 `review_queue` 覆盖该 Agent 的决策范围，因此同一 Agent 的另一个窗口可以复核第一个窗口提交的任务。自审默认允许，并以 `self_review: true` 留痕；`agents.<id>.self_review: forbid` 会让 `approve` 和 `rework` 都要求由其他 Agent 执行。只有不能复核的执行者，`show` 才限制为只能查看分配给自己的任务。
 
 这些检查约束可信工作流及提交差异，不提供运行时沙箱，也不限制执行进程读取文件系统。
 
@@ -107,18 +110,18 @@ python scripts/smoke_project.py --config <config_file> --runtime agent_hub.py
 
 消息传输通道保持关闭；旧 Feishu/Lark 实现未包含在仓库中。Agent 身份和角色校验用于组织可信工作流，不为不可信网络用户提供身份认证。
 
-## 从 2.4.1 或更早版本升级
+## 从 2.4.2 或更早版本升级
 
 1. 暂停权威主机命令，使用 SQLite 备份机制，或在权威服务停止后备份状态库。回滚不再需要你另行保留旧运行时：部署会留存它替换掉的那一代，`--rollback` 可将其还原。
-2. 阅读[变更记录](CHANGELOG.md)，安装 2.4.2 运行时，并将私有配置中的 `agenthub_version` 更新为 `2.4.2`，使结构审计与运行时版本一致。
-3. 配置 schema 仍为 **1**，数据库 schema 仍为 **4**。session、心跳和认领代次列，以及新增的 `depends_on_json`、`gates_json`、`artifacts_json`、`allow_path_overlap` 列都就地添加；历史任务与检查点保留，旧运行时会忽略新列。未使用新可选字段的既有合同行为不变。
+2. 阅读[变更记录](CHANGELOG.md)，安装 2.4.3 运行时，并将私有配置中的 `agenthub_version` 更新为 `2.4.3`，使结构审计与运行时版本一致。
+3. 配置 schema 仍为 **1**，数据库 schema 仍为 **4**。2.4.3 不新增列、不需要迁移：`self_review` 是可选的 Agent 策略，自审标记写入已有的复核事件明细。2.4.1 的 session/心跳列和 2.4.2 的 `depends_on_json`、`gates_json`、`artifacts_json`、`allow_path_overlap` 列保持原样；旧运行时会忽略它们。
 4. 未配置 `execution.session_policy` 的项目保持 `optional`：不传 session 的命令行为不变，旧的未绑定认领仍然可见。要把长任务与其他窗口隔离，设为 `required`，然后用 `heartbeat --session <id>` 为每个在途认领绑定一次。已绑定任务只接受同一 session；管理员可代执行者绑定未绑定任务。
 5. 长任务可以跨部署继续运行：部署不触碰 SQLite 状态，`tests/test_upgrade.py` 覆盖运行时切换。该升级**不要**使用 `--require-idle`。部署后先绑定在途任务，再执行下一次 checkpoint 或 submit。
 6. 如需让同一执行者并发推进多个任务，将 `execution.concurrency` 设为 `multiple_tasks_per_executor`，并将 `execution.max_active_tasks_per_executor` 设为 1..32；可用 `agents.<id>.max_active_tasks` 下调单个执行者的上限。
 7. 普通交接前保存本轮检查点。以前被接受的不完整替代合同、重复序号和涉及禁止路径的重命名，现在会被拒绝；不会改写历史合同。
 8. 运行结构审计、测试和隔离烟雾测试；恢复任务前，按部署流程验证真实启动器。
 
-2.4.2 升级时请先检查活动合同：`allowed_paths` 现在会在 `post` 时与其他活动任务冲突，共享前缀的一批合同必须用 `depends_on` 串行化，或显式设置 `allow_path_overlap: true`。只有合同会声明 `artifacts` 时才需要配置 `execution.artifact_root`。门禁声明是可选的，只影响使用它的合同。
+2.4.3 不需要迁移合同或状态。现有 Agent 保持允许自审；需要强制独立复核时设置 `agents.<id>.self_review: forbid`。双角色 Agent 的 `context` 新增 `role_mode`、`overview`、`review_queue` 和 `self_review` 块，`tasks`/`excluded` 保持原有形状。`show` 现在允许同时具备复核能力的 Agent 查看分配给其他执行者的任务。2.4.2 的合同规则继续有效：`allowed_paths` 与其他活动任务重叠时，除非用 `depends_on` 串行化或显式设置 `allow_path_overlap: true`，否则 `post` 会被拒绝；只有声明 `artifacts` 的合同才需要 `execution.artifact_root`；门禁声明只影响使用它的合同。
 
 公开版本不会自动部署或修改任何现有私有项目。
 

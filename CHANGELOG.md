@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.4.3 — 2026-10-26
+
+### Added
+
+- Roles are additive, so one Agent may hold `decider` and `executor` (optionally `administrator`) without a second identity. For such an Agent, `context` returns one workbench with `role_mode: hybrid`: `tasks` is the session-scoped execution focus, `overview` lists active work in the Agent's decision scope, and `review_queue` lists `blocked`/`review` tasks. A second window of the same Agent can therefore review work submitted by the first, while `next` remains execution-focused.
+- `agents.<id>.self_review` accepts `allow` (default) or `forbid` on an Agent that has both an execution and a review role. A self-approval or self-rework is recorded as `self_review: true` in the review event and exposed by `latest_review`; `forbid` rejects both actions until another Agent with review permission acts.
+- `context` now includes `review_queue` for decider-only Agents as well. `context` and `next` are otherwise unchanged for single-role Agents.
+
+### Fixed
+
+- `show` no longer treats an Agent that is both executor and reviewer as an executor-only identity. The restriction to assigned tasks now applies only when the Agent has `executor` and no `decider`/`administrator` role.
+- `close` clears `claimed_by` and preserves the executor in the `task.close` event, matching the invariant that a terminal task has no current claimant.
+- Configuration validation rejects non-array or empty-string `roles`/`devices`, an invalid `self_review` value, and a `self_review` key on an Agent without both an execution and a review role, instead of failing later with a misleading error or silently ignoring the policy.
+- Removed the project-specific `Codex` wording from the core `context` payload and the control-plane operating standard; core text is now role-neutral.
+
+### Changed
+
+- Version 2.4.3. `context` adds `role_mode`, `overview`, `review_queue` and (for dual-role Agents) a `self_review` block. Existing `tasks`, `excluded`, `concurrency` and `decisions` fields retain their shape.
+
+### Upgrade notes
+
+Configuration schema 1 and database schema 4 are unchanged. No column is added and no state migration is required: the self-review marker lives in the existing review event detail, so an older runtime can still read the state. Existing Agents default to `self_review: allow`, preserving 2.4.2 behavior; set `agents.<id>.self_review: forbid` when an independent reviewer is mandatory. The 2.4.2 contract rules continue to apply. Bump the private registration's `agenthub_version` to 2.4.3.
+
 ## 2.4.2 — 2026-10-23
 
 ### Added

@@ -37,7 +37,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-VERSION = "2.4.2"
+VERSION = "2.4.3"
 MAX_PACKET_BYTES = 16_384
 ROOT = Path(__file__).resolve().parent
 COMMANDS = {"init", "status", "context", "next", "show", "post", "claim", "claim-next", "handoff", "checkpoint", "submit", "heartbeat", "review", "close", "decision", "audit", "rpc", "cancel", "supersede", "release", "prune"}
@@ -47,6 +47,7 @@ CONCURRENCY_MULTI = "multiple_tasks_per_executor"
 CONCURRENCY_MODES = {CONCURRENCY_ONE, CONCURRENCY_MULTI}
 ISOLATION_MODES = {"git_worktree_per_task"}
 SESSION_POLICIES = {"optional", "required"}
+SELF_REVIEW_POLICIES = {"allow", "forbid"}
 SESSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 MAX_ACTIVE_TASKS_CEILING = 32
 MAX_LEASE_MINUTES = 10080
@@ -64,6 +65,22 @@ PERMISSIONS = {
 
 class HubError(RuntimeError):
     pass
+
+
+def agent_roles(info: dict[str, Any]) -> set[str]:
+    return set(info.get("roles", []))
+
+
+def has_executor_role(info: dict[str, Any]) -> bool:
+    return "executor" in agent_roles(info)
+
+
+def has_review_role(info: dict[str, Any]) -> bool:
+    return bool(agent_roles(info) & {"decider", "administrator"})
+
+
+def self_review_policy(config: dict[str, Any], agent: str) -> str:
+    return config["agents"].get(agent, {}).get("self_review", "allow")
 
 
 def now() -> str:
@@ -232,14 +249,29 @@ def load_config(path: Path) -> dict[str, Any]:
     if not isinstance(config.get("agents"), dict) or not config["agents"]:
         raise HubError("项目必须声明至少一个 Agent")
     for agent_id, info in config["agents"].items():
-        if not isinstance(info, dict) or not info.get("roles") or not info.get("devices"):
-            raise HubError(f"Agent {agent_id} 必须声明 roles 和 devices")
-        unknown_roles = sorted(set(info["roles"]) - set(PERMISSIONS))
+        if not isinstance(info, dict):
+            raise HubError(f"Agent {agent_id} 必须是 JSON 对象")
+        roles = info.get("roles")
+        devices = info.get("devices")
+        if not isinstance(roles, list) or not roles or any(
+            not isinstance(role, str) or not role.strip() for role in roles
+        ):
+            raise HubError(f"Agent {agent_id} 的 roles 必须是非空字符串数组")
+        if not isinstance(devices, list) or not devices or any(
+            not isinstance(device, str) or not device.strip() for device in devices
+        ):
+            raise HubError(f"Agent {agent_id} 的 devices 必须是非空字符串数组")
+        unknown_roles = sorted(set(roles) - set(PERMISSIONS))
         if unknown_roles:
             raise HubError(f"Agent {agent_id} 包含未知角色: {unknown_roles}")
-        unknown_devices = sorted(set(info["devices"]) - set(config["devices"]))
+        unknown_devices = sorted(set(devices) - set(config["devices"]))
         if unknown_devices:
             raise HubError(f"Agent {agent_id} 引用了未知设备: {unknown_devices}")
+        self_review = info.get("self_review", "allow")
+        if self_review not in SELF_REVIEW_POLICIES:
+            raise HubError(f"Agent {agent_id} 的 self_review 仅支持 {sorted(SELF_REVIEW_POLICIES)}")
+        if "self_review" in info and not (has_executor_role(info) and has_review_role(info)):
+            raise HubError(f"Agent {agent_id} 的 self_review 仅适用于同时具备执行与复核角色的 Agent")
     authority = config.get("state_authority", {})
     if authority.get("host") not in config["devices"] or not authority.get("database"):
         raise HubError("state_authority 必须声明已注册 host 和 database")
@@ -912,7 +944,13 @@ def latest_review(conn: sqlite3.Connection, task_id: str) -> dict[str, Any] | No
     if not row:
         return None
     detail = load_state_json(row["detail_json"], f"events[{task_id}].review.detail")
-    return {"action": "approve" if "approve" in row["action"] else "rework", "note": detail.get("note", ""), "agent": row["agent_id"], "occurred_at": row["occurred_at"]}
+    return {
+        "action": "approve" if "approve" in row["action"] else "rework",
+        "note": detail.get("note", ""),
+        "agent": row["agent_id"],
+        "self_review": bool(detail.get("self_review", False)),
+        "occurred_at": row["occurred_at"],
+    }
 
 def task_summary(row: sqlite3.Row) -> dict[str, Any]:
     lease = lease_state(row)
@@ -934,6 +972,17 @@ def task_summary(row: sqlite3.Row) -> dict[str, Any]:
             passed = sum(1 for gate in computed if isinstance(gate, dict) and gate.get("passed") is True)
             summary["gate_status"] = {"total": len(computed), "passed": passed}
     return summary
+
+
+def review_queue_entry(row: sqlite3.Row, agent: str) -> dict[str, Any]:
+    """A compact action item; the full task stays available through `show`."""
+    return {
+        "id": row["task_id"], "title": row["title"], "priority": row["priority"],
+        "status": row["status"], "assignee": row["assignee"], "claimed_by": row["claimed_by"],
+        "claim_session": row["claim_session"], "decision_key": row["decision_key"],
+        "self_review": bool(row["claimed_by"] and row["claimed_by"] == agent),
+        "updated_at": row["updated_at"],
+    }
 
 
 def task_packet(conn: sqlite3.Connection, row: sqlite3.Row, config: dict[str, Any], session: str | None = None) -> dict[str, Any]:
@@ -1151,37 +1200,61 @@ def executor_task_row(
 
 def do_context(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, session: str | None) -> None:
     info = identity(config, agent, device, "context")
-    roles = set(info["roles"])
-    is_executor = "executor" in roles
-    limit = task_limit(config, agent) if is_executor else None
-    active = len(active_task_ids(conn, agent)) if is_executor else None
+    roles = agent_roles(info)
+    executor = "executor" in roles
+    reviewer = has_review_role(info)
+    role_mode = "hybrid" if executor and reviewer else ("executor" if executor else "decider")
+    limit = task_limit(config, agent) if executor else None
+    active = len(active_task_ids(conn, agent)) if executor else None
     excluded: list[dict[str, Any]] = []
-    if is_executor:
+    if executor:
         row, excluded = executor_task_row(conn, config, agent, session)
         tasks = [task_packet(conn, row, config, session)] if row else []
     else:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE status IN ('ready','in_progress','blocked','review','approved') AND status != 'cancelled' ORDER BY priority,created_at,task_id"
-        ).fetchmany(25)
+            "SELECT * FROM tasks WHERE status IN ('ready','in_progress','blocked','review','approved') "
+            "ORDER BY priority,created_at,task_id LIMIT 25"
+        ).fetchall()
         tasks = [task_summary(row) for row in rows]
     decisions = [dict(row) for row in conn.execute(
         "SELECT decision_key,summary,rationale,decided_by,updated_at FROM decisions ORDER BY updated_at DESC LIMIT 10"
     )]
-    if is_executor and limit == 1:
-        rule = "决策者发布不可变执行合同并复核；执行者一次只推进一个活动任务；换设备必须 checkpoint 后 handoff。"
-    elif is_executor:
-        rule = f"决策者发布不可变执行合同并复核；执行者最多同时推进 {limit} 个活动任务，用 next --session <id> --available 或 claim-next 领取新任务；换设备必须 checkpoint 后 handoff。"
+    if role_mode == "hybrid":
+        rule = (
+            f"该 Agent 同时具备决策与执行角色：最多同时推进 {limit} 个活动任务；"
+            f"提交后在 review_queue 复核（self_review={self_review_policy(config, agent)}）；"
+            "换设备必须 checkpoint 后 handoff。"
+        )
+    elif executor:
+        if limit == 1:
+            rule = "决策者发布不可变执行合同并复核；执行者一次只推进一个活动任务；换设备必须 checkpoint 后 handoff。"
+        else:
+            rule = f"决策者发布不可变执行合同并复核；执行者最多同时推进 {limit} 个活动任务，用 next --session <id> --available 或 claim-next 领取新任务；换设备必须 checkpoint 后 handoff。"
     else:
         rule = "决策者发布不可变执行合同并复核；执行者按项目并发上限推进任务；换设备必须 checkpoint 后 handoff。"
     payload: dict[str, Any] = {
         "project": config["project_id"], "agent": agent, "roles": info["roles"], "device": device,
-        "session": session, "session_policy": session_policy(config),
+        "role_mode": role_mode, "session": session, "session_policy": session_policy(config),
         "repository": repository_snapshot(config),
         "operating_rule": rule,
         "decisions": decisions, "tasks": tasks, "excluded": excluded,
-        "detail_rule": "blocked/review 必须 show 后决策；approved 等待用户确认合并，再由 Codex close。",
+        "detail_rule": "blocked/review 必须 show 后决策；approved 等待用户确认合并，再由具备 close 权限的 Agent 关闭。",
     }
-    if is_executor:
+    if reviewer:
+        queue_rows = conn.execute(
+            "SELECT * FROM tasks WHERE status IN ('blocked','review') "
+            "ORDER BY priority,created_at,task_id LIMIT 25"
+        ).fetchall()
+        payload["review_queue"] = [review_queue_entry(queue_row, agent) for queue_row in queue_rows]
+        if executor:
+            overview_rows = conn.execute(
+                "SELECT * FROM tasks WHERE status IN ('ready','in_progress','blocked','review','approved') "
+                "ORDER BY priority,created_at,task_id LIMIT 25"
+            ).fetchall()
+            payload["overview"] = [task_summary(overview_row) for overview_row in overview_rows]
+    if role_mode == "hybrid":
+        payload["self_review"] = {"policy": self_review_policy(config, agent), "capable": True}
+    if executor:
         payload["concurrency"] = {"active": active, "limit": limit}
         if session_policy(config) == "required" and not session:
             payload["session_required"] = True
@@ -1211,8 +1284,8 @@ def do_show(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device
             session: str | None = None) -> None:
     info = identity(config, agent, device, "show")
     row = load_task(conn, task_id)
-    if "executor" in set(info.get("roles", [])) and row["assignee"] != agent:
-        raise HubError("执行者只能查看分配给自己的任务")
+    if has_executor_role(info) and not has_review_role(info) and row["assignee"] != agent:
+        raise HubError("仅执行角色的 Agent 只能查看分配给自己的任务")
     print(json.dumps({
         "task": task_packet(conn, row, config, session),
         "submissions": submission_history(conn, task_id),
@@ -1847,13 +1920,20 @@ def do_review(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devi
             claim_session = None
         else:
             raise HubError("action 仅允许 approve 或 rework")
+        self_executed = bool(row["claimed_by"] and row["claimed_by"] == agent)
+        if self_executed and self_review_policy(config, agent) == "forbid":
+            raise HubError(
+                f"Agent {agent} 的 self_review=forbid：不能复核自己执行的任务 {task_id}；"
+                "请由其他具备复核权限的 Agent 处理"
+            )
         result_value = row["result_json"] if action == "approve" else None
         conn.execute(
             "UPDATE tasks SET status=?,claimed_by=?,active_device=?,claim_session=?,"
             "last_heartbeat_at=NULL,lease_seconds=0,result_json=?,updated_at=? WHERE task_id=?",
             (target, claimed_by, active_device, claim_session, result_value, now(), task_id),
         )
-        record(conn, agent, device, f"task.review.{action}", task_id, {"note": note.strip()})
+        record(conn, agent, device, f"task.review.{action}", task_id,
+               {"note": note.strip(), "self_review": self_executed})
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1899,14 +1979,14 @@ def do_close(conn: sqlite3.Connection, config: dict[str, Any], agent: str, devic
             and bool(git(config, "show-ref", "--verify", f"refs/heads/{row['branch']}", check=False))
         )
         cursor = conn.execute(
-            "UPDATE tasks SET status='closed',active_device=NULL,claim_session=NULL,"
+            "UPDATE tasks SET status='closed',claimed_by=NULL,active_device=NULL,claim_session=NULL,"
             "last_heartbeat_at=NULL,lease_seconds=0,updated_at=? WHERE task_id=? AND status='approved'",
             (now(), task_id),
         )
         if cursor.rowcount != 1:
             raise HubError("任务状态已被其他命令改变，关闭失败")
         detail = {
-            "task_commit": task_commit, "merge_commit": merge_commit,
+            "task_commit": task_commit, "merge_commit": merge_commit, "executor": row["claimed_by"],
             "target_branch": target_branch, "session": row["claim_session"], "note": note.strip(),
         }
         if artifacts:

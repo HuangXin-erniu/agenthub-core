@@ -1,4 +1,4 @@
-# AgentHub v2.4.2 project registration standard
+# AgentHub v2.4.3 project registration standard
 
 ## Boundary
 
@@ -38,6 +38,26 @@ No concrete value from one registration may appear in core source or another reg
 Each task keeps its own worktree, branch and active device, so concurrent tasks never share a working directory. `next --session <id> --available` returns the highest-priority ready task that nobody has claimed, `claim-next` selects and claims one atomically, and `release` returns a stuck `in_progress` task to `ready` without deleting its worktree. The current executor may release its own task from any device it is allowed to use; an administrator may release any task.
 
 `execution.isolation` may only be `git_worktree_per_task`. A project may not run two active tasks in the same `chain_id`.
+
+## Dual roles and self-review
+
+Roles are additive: an Agent may list `decider`, `executor` and `administrator` together. A project can therefore model a single-Agent workflow without inventing a second identity. For such an Agent, `context` returns one workbench with `role_mode: hybrid`: `tasks` is the execution focus selected for the declared session, `overview` lists active tasks in the Agent's decision scope, and `review_queue` lists `blocked`/`review` tasks with a `self_review` flag. The decider and executor views are no longer mutually exclusive; a second window of the same Agent can review a task submitted by the first.
+
+Self-review is allowed by default for backward compatibility. When an Agent approves or reworks a task it executed, the review event and `latest_review` record `self_review: true`. To require an independent reviewer, declare:
+
+```json
+"agents": {
+  "<agent_id>": {
+    "roles": ["administrator", "decider", "executor"],
+    "devices": ["<authority_device_id>", "<client_device_id>"],
+    "self_review": "forbid"
+  }
+}
+```
+
+`self_review` accepts `allow` (default) or `forbid`. With `forbid`, both `approve` and `rework` are rejected when the reviewing Agent is the one that executed the task; another Agent with review permission must act. The policy is agent-scoped, so one dual-role Agent in a mixed project can self-review while another cannot. It is accepted only when the Agent has `executor` and a review role (`decider` or `administrator`); on a single-role Agent it is a configuration error.
+
+`show` restricts an Agent to its own assigned tasks only when it has `executor` and no review role (`decider` or `administrator`). An Agent that can review may inspect tasks assigned to other executors, which is what makes the hybrid workbench and independent review possible.
 
 ## Dependencies, gates and artifacts
 
@@ -85,9 +105,9 @@ Order of operations when upgrading:
 6. If the registration uses `session_policy: required`, bind every in-flight claim before its next mutation: `heartbeat <executor> <task_id> --session <window_id>`. A run that was claimed before the upgrade has no session yet.
 7. If the new version turns out to be wrong, `python3 scripts/deploy_project.py --project <project_id> --rollback` restores the retained generation and re-runs the self-check. One generation is retained, so this undoes the most recent deployment; restore state from your own backup if the change involved it.
 
-What is guaranteed across versions, and what is checked: configuration schema 1 and database schema 4 stay compatible, and schema changes are additive only. Version 2.4.1 added the session columns; version 2.4.2 adds `depends_on_json`, `gates_json`, `artifacts_json` and `allow_path_overlap` in place. Older runtimes ignore them. Existing configurations that omit the concurrency and session keys keep the one-task-per-executor and session-optional behavior. `tests/test_upgrade.py` asserts that the previous release's runtime can still read state written by the current one, including state with two tasks in progress, so a release that needs to break that has to say so explicitly.
+What is guaranteed across versions, and what is checked: configuration schema 1 and database schema 4 stay compatible, and schema changes are additive only. Version 2.4.1 added the session columns; version 2.4.2 added `depends_on_json`, `gates_json`, `artifacts_json` and `allow_path_overlap`; version 2.4.3 adds no column and stores the self-review marker in the existing review event detail. Older runtimes ignore newer columns. Existing configurations that omit the concurrency and session keys keep the one-task-per-executor and session-optional behavior. `tests/test_upgrade.py` asserts that the previous release's runtime can still read state written by the current one, including state with two tasks in progress, so a release that needs to break that has to say so explicitly.
 
-For 2.4.2, review queued contracts before deploying: `post` now rejects `allowed_paths` overlaps with active tasks unless the contracts are sequenced by `depends_on` or set `allow_path_overlap: true`. Set `execution.artifact_root` only if contracts will declare `artifacts`. Gate declarations are optional and only affect contracts that use them.
+For 2.4.3, no contract or state migration is required. Existing Agents keep self-review allowed; set `agents.<id>.self_review: forbid` only when independent review is mandatory. `context` gains `role_mode`, `overview`, `review_queue` and a `self_review` block for dual-role Agents, while `tasks` and `excluded` keep their existing shape. `show` now permits an Agent with review permission to inspect another executor's task. The 2.4.2 contract rules still apply: `post` rejects `allowed_paths` overlaps with active tasks unless the contracts are sequenced by `depends_on` or set `allow_path_overlap: true`; `execution.artifact_root` is required only for contracts that declare `artifacts`; gate declarations only affect contracts that use them.
 
 The `windows_cmd` adapter implements the same ordering and the same self-check, but only its generated scripts are tested here; it has not been exercised against a real Windows authority.
 

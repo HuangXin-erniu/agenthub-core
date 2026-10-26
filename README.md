@@ -1,4 +1,4 @@
-# AgentHub Core 2.4.2
+# AgentHub Core 2.4.3
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -31,6 +31,8 @@ Authority host: canonical Git repository + local SQLite state + task worktrees
 | decider | Decisions, task contracts, inspection and evidence review |
 | executor | Claim assigned tasks, checkpoint, handoff and submit results |
 
+Roles are additive. One Agent may hold `decider` and `executor` (optionally `administrator`) and use one unified `context`: `role_mode` is `hybrid`, `tasks` is the current execution focus, `overview` lists active work and `review_queue` lists `blocked`/`review` tasks with a `self_review` flag. An executor that also reviews may approve its own submission; the review event and packet record `self_review: true`. Set `agents.<id>.self_review: forbid` to require an independent reviewer; the key is valid only for an Agent that has both an execution role and a review role. Only an Agent that has `executor` and no review role is restricted by `show` to its own assigned tasks.
+
 ```text
 decision -> post -> claim -> checkpoint / handoff -> submit -> review
                                                            | rework -> claim
@@ -58,7 +60,7 @@ python agent_hub.py --project <project_id> --device <device_id> next <executor_a
 python agent_hub.py --project <project_id> --device <device_id> --session <window_id> next <executor_agent_id> --available
 ```
 
-For a local authority with an explicit private configuration, use `--local --config <config_file>`. Always declare the executing device. Version 2.4.2 retains the 2.3.1 CLI parameters and configuration format; `next --available`, `claim-next`, `release`, `--session`, `heartbeat`, `status --decision`, and the contract fields `depends_on`, `gates`, `artifacts` and `allow_path_overlap` are additive.
+For a local authority with an explicit private configuration, use `--local --config <config_file>`. Always declare the executing device. Version 2.4.3 retains the 2.3.1 CLI parameters and configuration format; `next --available`, `claim-next`, `release`, `--session`, `heartbeat`, `status --decision`, the contract fields `depends_on`, `gates`, `artifacts` and `allow_path_overlap`, the optional `agents.<id>.self_review` policy, and the additive `context` fields `role_mode`, `overview` and `review_queue` are supported.
 
 | Commands | Purpose |
 | --- | --- |
@@ -82,6 +84,7 @@ Each subcommand supports `--help`. JSON arguments accept inline JSON or `@<file>
 - **Paths:** submission checks every changed path; a rename checks both source and destination. Forbidden patterns take precedence. NUL-separated Git output preserves Unicode, spaces and supported special filenames; paths that cannot be decoded reliably as UTF-8 are rejected. Existing `fnmatch` semantics remain: `src/*` also matches `src/nested/file.py`, and case normalization follows the host OS.
 - **Concurrency:** each task keeps its own worktree, branch and active device. Executors default to one in-progress task; a project may enable `multiple_tasks_per_executor` with a bounded `max_active_tasks_per_executor`, optionally lowered per executor. `next --session <id> --available` lists unclaimed work, `claim-next` claims it atomically, and `release` returns a stuck task to `ready` without deleting its worktree. Only `in_progress` tasks consume a slot.
 - **Sessions and long tasks:** a claim records the window that made it. `checkpoint`, `submit`, `handoff` and `release` reject a different window of the same executor identity. With `execution.session_policy: required`, claims need a session and an existing unbound claim must be bound once with `heartbeat --session <id>`. `next`/`context` with a session show that session's tasks and unclaimed ready work; without one they skip session-bound tasks and list them under `excluded`. A lease is advisory: `status`/`next` report `lease_expired`, but nothing is released automatically. External shared state (datasets, run outputs) remains project-owned; sessions isolate workflow ownership, not filesystem writes.
+- **Dual roles and self-review:** an Agent holding both decision and execution roles receives one `context` workbench instead of choosing between a decider view and an executor view. Its execution focus stays scoped to the declared session, while `overview` and `review_queue` cover the Agent's decision scope, so a second window can review work submitted by the first. Self-review is allowed by default and audited with `self_review: true`; `agents.<id>.self_review: forbid` makes both `approve` and `rework` require a different Agent. `show` is restricted to assigned tasks only for Agents that cannot review.
 
 These checks govern trusted workflow and committed changes. They do not sandbox running agents or prevent filesystem reads.
 
@@ -107,18 +110,18 @@ Deployment replaces managed files one by one, so it is not a transaction across 
 
 Messaging transports are disabled. Legacy Feishu/Lark implementations are omitted. Agent identities and role checks organize trusted workflow; they do not authenticate untrusted network users.
 
-## Upgrade from 2.4.1 or earlier
+## Upgrade from 2.4.2 or earlier
 
 1. Pause Authority commands and back up its SQLite state using an SQLite-aware backup or a stopped Authority. Nothing else needs to be kept aside for rollback: a deployment retains the generation it replaces, and `--rollback` restores it.
-2. Review the [changelog](CHANGELOG.md), install the 2.4.2 runtime and update your private configuration's `agenthub_version` to `2.4.2` so the structural audit agrees with the runtime.
-3. Configuration schema remains **1** and database schema remains **4**. The session, heartbeat and claim-generation columns, plus the new `depends_on_json`, `gates_json`, `artifacts_json` and `allow_path_overlap` columns, are added in place; existing task and checkpoint history is preserved. Older runtimes ignore the new columns. Existing contracts without the new optional fields behave as before.
+2. Review the [changelog](CHANGELOG.md), install the 2.4.3 runtime and update your private configuration's `agenthub_version` to `2.4.3` so the structural audit agrees with the runtime.
+3. Configuration schema remains **1** and database schema remains **4**. Version 2.4.3 adds no column and no migration: `self_review` is an optional Agent policy and the audit marker is stored in the existing review event detail. The 2.4.1 session/heartbeat columns and the 2.4.2 `depends_on_json`, `gates_json`, `artifacts_json` and `allow_path_overlap` columns remain as documented; older runtimes ignore them.
 4. Configurations without `execution.session_policy` keep `optional`: session-less commands behave as before, and legacy unbound claims remain visible. To isolate long tasks from other windows, set it to `required`, then bind each running claim once with `heartbeat --session <id>`. A bound claim accepts only its own session; an administrator may bind an unbound claim on the executor's behalf.
 5. Long tasks may stay in flight across the deploy: deployment never touches SQLite state and `tests/test_upgrade.py` covers the runtime swap. Do not use `--require-idle` for that upgrade. After the deploy, bind the running claim before its next checkpoint or submit.
 6. To enable concurrent tasks for one executor, set `execution.concurrency` to `multiple_tasks_per_executor` and `execution.max_active_tasks_per_executor` to a value from 1 to 32. Optionally lower an individual executor's limit with `agents.<id>.max_active_tasks`.
 7. Save a current checkpoint before ordinary handoff. Previously accepted incomplete replacement contracts, repeated sequences and renames involving forbidden paths are rejected. Historical contracts are not rewritten.
 8. Run the structural audit, tests and isolated smoke check; validate the real launcher under your deployment process before resuming tasks.
 
-For 2.4.2, review active contracts before posting new ones: `allowed_paths` now conflicts with other active tasks at `post` time, so a batch of contracts sharing a prefix must be sequenced with `depends_on` or acknowledged with `allow_path_overlap: true`. Set `execution.artifact_root` only if contracts will declare `artifacts`. Gate declarations are optional and only affect contracts that use them.
+For 2.4.3, no contract or state migration is required. Existing Agents keep self-review allowed; set `agents.<id>.self_review: forbid` when an independent reviewer is mandatory. `context` gains `role_mode`, `overview`, `review_queue` and a `self_review` block for dual-role Agents, while `tasks` and `excluded` keep their existing shape. `show` now lets an Agent that also reviews inspect tasks assigned to other executors. Previously accepted 2.4.2 rules still apply: `allowed_paths` overlaps are rejected at `post` unless sequenced with `depends_on` or acknowledged with `allow_path_overlap: true`; `execution.artifact_root` is required only for contracts that declare `artifacts`; gate declarations only affect contracts that use them.
 
 This public release does not deploy or modify any existing private project automatically.
 
