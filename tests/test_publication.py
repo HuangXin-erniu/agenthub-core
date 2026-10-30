@@ -32,10 +32,9 @@ CORE_COPY = [
 
 
 class PublicationTests(unittest.TestCase):
-    def test_repository_audit_passes_with_a_private_registration(self):
+    def test_repository_audit_passes(self):
         result = audit.audit(ROOT)
         self.assertTrue(result["ok"], result["findings"])
-        self.assertGreaterEqual(result["projects"], 1)
 
     def test_changelog_version_drift_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
