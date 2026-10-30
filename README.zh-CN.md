@@ -1,92 +1,103 @@
-# AgentHub Core 2.4.3
+# AgentHub Core
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-AgentHub 是一个轻量、以决策为起点的多 Agent 协作控制平面，支持多个独立项目。决策者发布精简、不可变的任务合同；执行者在隔离的 Git worktree 中工作，并返回提交、验证证据或明确的阻塞原因。
+AgentHub 是一个轻量、决策先行的多 Agent 协作控制面。决策者发布紧凑且不可变的执行合同；
+执行者在隔离的 Git worktree 中工作，提交代码、证据或明确的阻塞项。
 
-本仓库仅包含通用机制、实现、模板和测试。真实项目注册、业务源码、数据集、模型、凭据和工作流数据库均不进入公开 Git 历史。代码只使用 Python 标准库，无需安装额外的 Python 包。
+本仓库只包含可复用的机制、模板和测试。项目注册、业务代码、数据集、模型、凭据和工作流
+数据库不进入公开历史。运行时只使用 Python 标准库。
+
+完整的命令、合同、配置和状态语义见 [docs/SPEC.md](docs/SPEC.md)；本文件只是快速入口。
 
 ## 环境要求
 
 - Python 3.10 或更高版本，以及支持 worktree 的 Git。
-- Windows 或 POSIX 主机；CI 覆盖 Windows/Linux 与 Python 3.10、3.13。
-- 远程客户端需要 OpenSSH，并单独配置可信 SSH 主机。
-- Windows 部署需要 PowerShell；POSIX 部署需要 sh 和 sha256sum。
-
-下文使用 `python`；也可以使用平台对应的 `python3` 命令。
+- Windows 或 POSIX 主机；CI 覆盖 Windows/Linux 与 Python 3.10/3.13。
+- 远端客户端需要 OpenSSH；部署需要 PowerShell 或 sh + sha256sum。
 
 ## 架构
 
 ```text
-AgentHub 核心：生命周期、角色权限、合同校验、SQLite schema
+AgentHub core：生命周期、角色权限、合同校验、SQLite 状态
     |
 私有项目注册：Agent、设备、路径、SSH 与部署映射
     |
-权威主机（Authority）：规范 Git 仓库 + 本地 SQLite 状态 + 任务 worktree
+权威主机：规范仓库 + 本地 SQLite 状态 + 任务 worktree
 ```
 
-| 角色 | 职责 |
-| --- | --- |
-| administrator | 治理、初始化、集成关闭、取消和替代任务 |
-| decider | 记录决策、发布任务合同、检查任务和复核证据 |
-| executor | 认领已分配任务、保存 checkpoint、交接设备和提交结果 |
+角色可叠加：`administrator`、`decider`、`executor`。一个 Agent 可同时具备多个角色并
+使用统一的 `context`。默认允许自审；设置 `agents.<id>.self_review: "forbid"` 可要求
+独立复核。
 
-角色可以叠加。同一 Agent 可同时具备 `decider` 与 `executor`（也可再加 `administrator`），并共用一份统一的 `context`：`role_mode` 为 `hybrid`，`tasks` 是当前执行焦点，`overview` 列出活动任务，`review_queue` 列出 `blocked`/`review` 任务并带 `self_review` 标记。同时具备复核能力的执行者可以批准自己的提交，复核事件和任务包会记录 `self_review: true`；设置 `agents.<id>.self_review: forbid` 可要求独立复核者，该键仅对同时具备执行角色和复核角色的 Agent 有效。只有具备 `executor` 且没有复核角色的 Agent，`show` 才限制为只能查看分配给自己的任务。
-
-```text
-decision -> post -> claim -> checkpoint / handoff -> submit -> review
-                                                           | rework -> claim
-                                                           | approve -> integration -> close
-```
-
-批准任务不会自动合并代码。应先按照正常的 Git 复核流程完成集成，再由 `close` 验证合并并移除任务 worktree。取消和替代操作保留历史。SQLite 状态由单一权威主机管理；每个任务只有一个活动设备，执行者默认同时只推进一个任务，启用并发后最多推进项目配置的上限。
-
-## 配置项目
-
-1. 将 `templates/project.example.json` 复制到私有的 `projects/<project_id>/project.json`。项目注册目录已被 Git 忽略。
-2. 替换所有尖括号占位符，包括 JSON 对象的键。声明稳定的项目、Agent 和设备 ID，指定规范 Git 仓库、权威主机本地状态文件及独立 worktree 目录。
-3. 本地使用时将 `remote.enabled` 设为 `false`。远程使用时选择 `windows_cmd` 或 `posix_sh`、对应部署适配器、可信 SSH 别名和严格的主机密钥检查。凭据应存放在 SSH 配置或凭据管理器中。
-4. 添加私有 `README.md`、`AGENTS.md` 及 `instructions` 声明的角色文件。根据操作系统启动器模板填写运行时、解释器、配置和状态路径。
-5. 部署时在 `deployment.managed_files` 中列出全部所需文件，包括角色说明。先审计、预览部署，再按自己的变更流程执行部署。
-
-参见[项目注册规范](docs/PROJECT_REGISTRATION.md)和[安全边界](SECURITY.md)。模板用于指导替换，不是可直接运行的实例。本仓库不附带或自动初始化任何项目。
-
-## 核心命令
+## 快速开始
 
 ```sh
-python agent_hub.py --help
 python agent_hub.py --project <project_id> --device <device_id> context <decider_agent_id>
 python agent_hub.py --project <project_id> --device <device_id> next <executor_agent_id>
-python agent_hub.py --project <project_id> --device <device_id> --session <window_id> next <executor_agent_id> --available
+python agent_hub.py --project <project_id> --device <device_id> --session <window_id> \
+  next <executor_agent_id> --available
 ```
 
-在本地权威主机使用显式私有配置时，采用 `--local --config <config_file>`。始终声明执行设备。2.4.3 保留 2.3.1 的 CLI 参数与配置格式；`next --available`、`claim-next`、`release`、`--session`、`heartbeat`、`status --decision`，合同字段 `depends_on`、`gates`、`artifacts`、`allow_path_overlap`，可选的 `agents.<id>.self_review` 策略，以及 `context` 新增的 `role_mode`、`overview`、`review_queue` 字段都受支持。
+全局参数必须写在子命令之前。本地权威主机可使用 `--local --config <config_file>`。
+始终声明执行设备。`--spec`、`--progress`、`--result` 接受内联 JSON 或 `@文件路径`。
+
+## 命令
 
 | 命令 | 用途 |
 | --- | --- |
-| init, status, context, next, show, audit | 初始化或查看已授权的工作流状态 |
-| decision, post, claim, claim-next | 记录决策、发布合同并认领分配的任务 |
-| checkpoint, heartbeat, handoff, submit, release | 保存进度、刷新保活、交接活动设备、释放任务并提交证据 |
-| review, close, cancel, supersede | 复核、验证集成，或保留取消和替代记录 |
+| `status`、`context`、`next`、`show`、`audit` | 查看授权范围内的状态 |
+| `decision`、`post` | 记录决策并发布合同 |
+| `claim`、`release` | 领取任务或交回队列 |
+| `checkpoint`、`heartbeat`、`handoff` | 保存进度、刷新存活、切换设备 |
+| `submit`、`review`、`close` | 提交证据、复核并集成 |
+| `cancel`、`supersede`、`prune` | 保留取消/替代历史并回收 worktree |
 
-`--session <id>`（或 `AGENTHUB_SESSION`）声明当前窗口。它和 agent/device 一样由调用方声明，不是安全凭证。`heartbeat` 刷新任务的 `last_heartbeat_at`；`--lease-minutes` 只让过期状态可见，永不触发自动释放。
+`claim <agent> [task_id]` 领取指定任务；省略 task_id 时领取下一个可用任务。2.4.5 已
+删除 `init` 和 `claim-next`；每个命令都会打开或迁移状态库，不需要单独初始化。
 
-各子命令均支持 `--help`。`--spec`、`--progress` 和 `--result` 接受内联 JSON 或 `@<file>`。任务合同包含执行者、决策键、基础提交、允许和禁止路径、验收标准、验证要求、交付物及证据要求。启用 `task_naming` 时，还必须提供符合配置的链 ID 和准确的下一序号。任务包最多为 16,384 个 UTF-8 字节。
+所有命令输出统一 JSON envelope（`{"ok": true, "data": ...}`）；领域错误在 stderr 输出
+`{"ok": false, "error": {"code": ...}}`。`--text` 输出人类可读摘要。详见
+[命令契约](docs/SPEC.md#4-command-line-contract)。
 
-## 工作流完整性与路由
+## 合同与流程
 
-- **合同校验**：`post` 与 `supersede` 共用必填字段、数组、优先级、预算、命名、决策和提交校验。序号在项目内全局递增，包含已取消任务，不能复用。新任务可以沿用被替代任务的链 ID，但不能与其他活动任务冲突。建立新任务与取消旧任务在一个事务内完成。
-- **任务依赖**：可选 `depends_on` 数组列出必须全部 `closed` 的前置任务。`claim`、`claim-next`、`next` 与 `next --available` 会拒绝或跳过未满足依赖的任务，并说明缺哪一个。若已关闭依赖的合并提交不在任务的 `base_commit` 中，任务包会给出警告，执行者可先合并目标分支，或由决策者用 `supersede` 更新基础提交。`chain_id` 仍然只是谱系别名，不承担排序语义。
-- **路径冲突**：`post` 会把新合同的 `allowed_paths` 与所有活动任务比对。重叠模式默认被拒绝，除非两任务由 `depends_on` 串行化，或合同显式设置 `allow_path_overlap: true`；显式豁免会写入 `task.post` 事件。通配模式按首个通配符前的静态前缀比较，宁可多报冲突。
-- **门禁与产物**：合同可声明数字型 `gates`（`id`、`metric`、`operator` 取 `>= > <= <`、`threshold`，可选 `source`）。completed 提交必须为每个门禁提供 `gate_results`；运行时计算通过与否，任一必需门禁失败就拒绝 completed（改用 blocked 把实测值与取舍交回决策者），`review approve` 会重新计算。项目可设置 `execution.artifact_root`，合同随后可用相对路径声明 `artifacts`；`submit` 与 `close` 都会校验交付物存在，`close` 在删除 worktree 之前拒绝缺失的产物。
-- **远程路由**：启用远程访问后，非 `state_authority.host` 的已注册设备通过 SSH 代理，适用于 Windows 和 POSIX 客户端。权威主机、远程访问关闭及显式 `--local` 均在本地执行。SSH 失败不会回退到本地数据库。
-- **设备交接**：当前执行者必须在活动设备上保存一个晚于最近一次认领或交接的 checkpoint。其他管理员可以通过现有交接命令恢复失联设备，但必须填写非空说明；恢复审计会记录是否缺少有效检查点。顺序依据事件 ID 判断，同一秒内的事件也能正确排序。
-- **路径边界**：提交时检查全部变更路径，重命名同时检查源路径和目标路径。禁止规则优先。以 NUL 分隔的 Git 输出保留 Unicode、空格及平台支持的特殊文件名；无法可靠解码为 UTF-8 的路径会被拒绝。保留现有 `fnmatch` 语义：`src/*` 也匹配 `src/nested/file.py`，大小写规范化遵循主机操作系统。
-- **并发任务**：每个任务保留独立的 worktree、分支和活动设备。执行者默认同时只推进一个任务；项目可以启用 `multiple_tasks_per_executor`，并通过 `max_active_tasks_per_executor` 限定上限，也可按执行者下调。`next --session <id> --available` 列出未被认领的任务，`claim-next` 原子领取，`release` 把卡住的任务退回 `ready` 且不删除 worktree。只有 `in_progress` 任务占用并发名额。
-- **会话与长任务**：认领时记录发起窗口。`checkpoint`、`submit`、`handoff` 和 `release` 会拒绝同一执行者身份的其他窗口。设置 `execution.session_policy: required` 后，认领必须带 session，已有的未绑定任务需先用 `heartbeat --session <id>` 绑定一次。带 session 的 `next`/`context` 只显示本窗口的任务和未认领的 ready 任务；不带 session 时跳过并列出其他窗口的任务（`excluded`）。租约只是告警：`status`/`next` 报告 `lease_expired`，但永不自动释放。数据集、运行产物等外部共享状态仍由项目自身约定；session 隔离的是工作流所有权，不是文件写入。
-- **双角色与自审**：同时具备决策和执行角色的 Agent 会得到一份统一的 `context` 工作台，而不是只能在决策视图和执行视图之间二选一。执行焦点仍按声明的 session 隔离，`overview` 与 `review_queue` 覆盖该 Agent 的决策范围，因此同一 Agent 的另一个窗口可以复核第一个窗口提交的任务。自审默认允许，并以 `self_review: true` 留痕；`agents.<id>.self_review: forbid` 会让 `approve` 和 `rework` 都要求由其他 Agent 执行。只有不能复核的执行者，`show` 才限制为只能查看分配给自己的任务。
+最小合同必填：`id`、`title`、`objective`、`assignee`、`decision_key`、`base_commit`、
+`instructions`、`acceptance`、`allowed_paths`。可选：`forbidden_paths`、`depends_on`、
+数值 `gates`、`artifacts`、`allow_path_overlap`、`priority`、`chain_id`。
 
-这些检查约束可信工作流及提交差异，不提供运行时沙箱，也不限制执行进程读取文件系统。
+```sh
+# 决策与合同
+python agent_hub.py ... decision <admin> --key D-1 --summary "..." --rationale "..."
+python agent_hub.py ... post <admin> --spec @task.json
+
+# 执行
+python agent_hub.py ... --session win-a claim <executor> TASK-001
+python agent_hub.py ... --session win-a checkpoint <executor> TASK-001 --progress @progress.json
+python agent_hub.py ... --session win-a submit <executor> TASK-001 --result @result.json
+
+# 复核与集成
+python agent_hub.py ... review <decider> TASK-001 --action approve --note "..."
+# 通过项目正常的已复核 Git 流程合并，然后：
+python agent_hub.py ... close <admin> TASK-001 --merge-commit <sha> --target-branch main --note "..."
+```
+
+`submit` 由核心计算门禁；必需门禁失败必须改用 `blocked` 提交。`close` 校验目标分支
+已包含批准提交，然后删除 worktree。
+
+## 并发、窗口与状态
+
+每个任务拥有独立 worktree、分支和活动设备。执行者默认只推进一个任务；设置
+`execution.max_active_tasks_per_executor`（1-32）可提高上限，也可用
+`agents.<id>.max_active_tasks` 单独下调。只有 `in_progress` 任务占用槽位。
+
+认领会记录调用方声明的 session。`checkpoint`、`submit`、`handoff`、`release` 会拒绝
+同一身份的其他窗口。`execution.session_policy: required` 下，认领必须带 session；旧
+的未绑定认领需先用 `--session <id> heartbeat <executor> <task_id>` 绑定一次。租约只做提示，过期不会自动释放。
+
+权威主机拥有 SQLite 状态和 worktree；不要放在同步目录中，并单独备份状态。首次打开
+schema 4 状态时会先写 `state.db.v4-<UTC 时间戳>.bak`，再原地迁移到 schema 5。
+2.4.3 不能直接读 schema 5；回滚需恢复该备份。
 
 ## 验证与部署
 
@@ -96,35 +107,24 @@ python -m unittest discover -s tests -v
 python scripts/check_release.py
 ```
 
-结构审计支持没有项目注册的核心仓库；存在私有注册时，还会检查配置、说明文件、部署源文件和项目隔离。发布检查器核对精确的公开文件白名单并扫描内容，不输出匹配到的敏感值。开发目录包含私有注册时，可使用 `--staged` 或 `--history` 仅检查计划提交的 Git 内容。
+部署逐个替换受管文件，但在第一次替换前校验全部哈希；保留被替换的上一代，部署后自检
+失败会自动恢复；支持 `--dry-run`、`--verify`、`--rollback`。部署不会修改 SQLite 状态。
+smoke 脚本会克隆配置仓库到临时目录，并使用一次性状态。
 
-```sh
-python scripts/deploy_project.py --project <project_id> --dry-run
-python scripts/deploy_project.py --project <project_id>
-python scripts/deploy_project.py --project <project_id> --verify
-python scripts/deploy_project.py --project <project_id> --rollback
-python scripts/smoke_project.py --config <config_file> --runtime agent_hub.py
-```
+## 从 2.4.3 升级
 
-部署逐个替换受管文件，因此不构成跨文件事务。它保证的顺序是：所有暂存文件在**任何**替换之前先逐个校验哈希；被替换的那一代先留存；换入后强制让**部署后的运行时加载部署后的配置**（唯一互相约束的一对受管文件）。自检失败会自动还原上一代，因此中间态要么可用、要么被检测并撤销。`--rollback` 按需还原留存的那一代，`--verify` 按哈希比对已部署文件与注册副本。权威状态从不参与部署：请单独以 SQLite 方式备份，并且只在明确需要重建状态时使用 `--reset-state`。烟雾测试将配置中的仓库克隆到临时目录，使用独立状态和 worktree，不调用私有启动器或部署文件；它用合成任务 ID 验证通用生命周期，命名规则由单元测试覆盖，`tests/test_upgrade.py` 覆盖「在途任务跨版本升级」。单元测试创建临时仓库，无需 SSH 或私有项目注册。
+1. 停止权威主机命令，用 SQLite 感知方式备份状态。
+2. 安装 2.4.5 运行时。
+3. 首次命令会把 schema 4 迁移到 5，并生成 v4 备份；在新状态验证完成前保留该备份，
+   它是唯一的降级路径。
+4. 从私有注册中删除旧可选键：`agenthub_version`、`project_name`、`workflow`、
+   `messaging_transports`、`lark_workflow`、`execution.concurrency`、
+   `execution.isolation` 以及命名目录子键。2.4.5 会忽略它们，但不应继续保留。
+5. 更新仍提到 `init` 或 `claim-next` 的角色说明。
+6. 恢复工作前运行审计、测试和隔离 smoke。
 
-消息传输通道保持关闭；旧 Feishu/Lark 实现未包含在仓库中。Agent 身份和角色校验用于组织可信工作流，不为不可信网络用户提供身份认证。
+## 贡献与许可
 
-## 从 2.4.2 或更早版本升级
-
-1. 暂停权威主机命令，使用 SQLite 备份机制，或在权威服务停止后备份状态库。回滚不再需要你另行保留旧运行时：部署会留存它替换掉的那一代，`--rollback` 可将其还原。
-2. 阅读[变更记录](CHANGELOG.md)，安装 2.4.3 运行时，并将私有配置中的 `agenthub_version` 更新为 `2.4.3`，使结构审计与运行时版本一致。
-3. 配置 schema 仍为 **1**，数据库 schema 仍为 **4**。2.4.3 不新增列、不需要迁移：`self_review` 是可选的 Agent 策略，自审标记写入已有的复核事件明细。2.4.1 的 session/心跳列和 2.4.2 的 `depends_on_json`、`gates_json`、`artifacts_json`、`allow_path_overlap` 列保持原样；旧运行时会忽略它们。
-4. 未配置 `execution.session_policy` 的项目保持 `optional`：不传 session 的命令行为不变，旧的未绑定认领仍然可见。要把长任务与其他窗口隔离，设为 `required`，然后用 `heartbeat --session <id>` 为每个在途认领绑定一次。已绑定任务只接受同一 session；管理员可代执行者绑定未绑定任务。
-5. 长任务可以跨部署继续运行：部署不触碰 SQLite 状态，`tests/test_upgrade.py` 覆盖运行时切换。该升级**不要**使用 `--require-idle`。部署后先绑定在途任务，再执行下一次 checkpoint 或 submit。
-6. 如需让同一执行者并发推进多个任务，将 `execution.concurrency` 设为 `multiple_tasks_per_executor`，并将 `execution.max_active_tasks_per_executor` 设为 1..32；可用 `agents.<id>.max_active_tasks` 下调单个执行者的上限。
-7. 普通交接前保存本轮检查点。以前被接受的不完整替代合同、重复序号和涉及禁止路径的重命名，现在会被拒绝；不会改写历史合同。
-8. 运行结构审计、测试和隔离烟雾测试；恢复任务前，按部署流程验证真实启动器。
-
-2.4.3 不需要迁移合同或状态。现有 Agent 保持允许自审；需要强制独立复核时设置 `agents.<id>.self_review: forbid`。双角色 Agent 的 `context` 新增 `role_mode`、`overview`、`review_queue` 和 `self_review` 块，`tasks`/`excluded` 保持原有形状。`show` 现在允许同时具备复核能力的 Agent 查看分配给其他执行者的任务。2.4.2 的合同规则继续有效：`allowed_paths` 与其他活动任务重叠时，除非用 `depends_on` 串行化或显式设置 `allow_path_overlap: true`，否则 `post` 会被拒绝；只有声明 `artifacts` 的合同才需要 `execution.artifact_root`；门禁声明只影响使用它的合同。
-
-公开版本不会自动部署或修改任何现有私有项目。
-
-## 贡献与许可证
-
-参阅[贡献说明](CONTRIBUTING.md)、[Agent 指引](AGENTS.md)和[安全说明](SECURITY.md)。版本 tag 与 GitHub Release 流程见 [RELEASING.md](RELEASING.md)。采用 [MIT 许可证](LICENSE)。
+阅读 [CONTRIBUTING.md](CONTRIBUTING.md)、[AGENTS.md](AGENTS.md) 和
+[SECURITY.md](SECURITY.md)。发布与 tag 流程见 [RELEASING.md](RELEASING.md)。
+本项目使用 [MIT](LICENSE) 许可。

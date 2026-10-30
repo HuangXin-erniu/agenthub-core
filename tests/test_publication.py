@@ -4,8 +4,8 @@ import contextlib
 import importlib.util
 import io
 import json
-import subprocess
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,79 +27,27 @@ hub = load("agenthub_runtime", "agent_hub.py")
 CORE_COPY = [
     "agent_hub.py", "scripts/deploy_project.py", "scripts/smoke_project.py",
     "scripts/check_release.py", "scripts/audit_agenthub.py", "templates/project.example.json",
-    "README.md", "README.zh-CN.md", "SECURITY.md", "docs/PROJECT_REGISTRATION.md", "CHANGELOG.md",
+    "CHANGELOG.md",
 ]
 
 
 class PublicationTests(unittest.TestCase):
-    def test_unregistered_core_passes_audit(self):
-        if list((ROOT / "projects").glob("*/project.json")):
-            self.skipTest("private registration present; run this test in an isolated core checkout")
-        result = audit.audit()
+    def test_repository_audit_passes_with_a_private_registration(self):
+        result = audit.audit(ROOT)
         self.assertTrue(result["ok"], result["findings"])
-        self.assertEqual(result["projects"], 0)
+        self.assertGreaterEqual(result["projects"], 1)
 
-    def test_version_drift_is_rejected(self):
+    def test_changelog_version_drift_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for relative in ("README.md", "README.zh-CN.md", "SECURITY.md",
-                             "docs/PROJECT_REGISTRATION.md", "CHANGELOG.md"):
-                target = root / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(ROOT / relative, target)
-            self.assertEqual(audit.version_findings(root, hub.VERSION), [])
-            readme = root / "README.md"
-            readme.write_text(readme.read_text(encoding="utf-8").replace(hub.VERSION, "0.0.0", 1),
-                              encoding="utf-8")
-            self.assertIn("version:README.md", audit.version_findings(root, hub.VERSION))
+            shutil.copyfile(ROOT / "CHANGELOG.md", root / "CHANGELOG.md")
+            self.assertEqual(audit.changelog_findings(root, hub.VERSION), [])
+            changelog = root / "CHANGELOG.md"
+            changelog.write_text(changelog.read_text(encoding="utf-8").replace(
+                f"## {hub.VERSION} —", "## 0.0.0 —", 1), encoding="utf-8")
+            self.assertIn("version:CHANGELOG.md", audit.changelog_findings(root, hub.VERSION))
 
-    def test_private_registration_audit_accepts_generic_role_and_device_names(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            for relative in CORE_COPY:
-                target = root / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(ROOT / relative, target)
-            project = root / "projects" / "audit_project"
-            project.mkdir(parents=True)
-            for name in ("AGENTS.md", "README.md"):
-                (project / name).write_text("private adapter")
-            config = {"schema_version": 1, "agenthub_version": hub.VERSION, "project_id": "audit_project",
-                      "devices": {"windows": {}},
-                      "agents": {"administrator": {"roles": ["administrator"], "devices": ["windows"]}},
-                      "state_authority": {"host": "windows", "database": str(root / "private-state.db"), "policy": "single_authority_local"},
-                      "execution": {"repository": str(root / "repository"), "worktree_root": str(root / "worktrees")},
-                      "messaging_transports": [], "lark_workflow": "hard_disabled"}
-            (project / "project.json").write_text(json.dumps(config))
-            result = audit.audit(root)
-            self.assertTrue(result["ok"], result["findings"])
-            self.assertEqual(result["projects"], 1)
-
-            (project / ".zcode" / "plans").mkdir(parents=True)
-            (project / ".zcode" / "plans" / "plan.md").write_text("local plan")
-            (project / "__pycache__").mkdir()
-            (project / "__pycache__" / "cache.pyc").write_bytes(b"cache")
-            (project / ".DS_Store").write_bytes(b"metadata")
-            result = audit.audit(root)
-            self.assertTrue(result["ok"], result["findings"])
-
-            (project / "unexpected.md").write_text("real mirror")
-            result = audit.audit(root)
-            self.assertFalse(result["ok"])
-            self.assertEqual(result["findings"],
-                             ["mirror:unexpected:projects/audit_project/unexpected.md"])
-            (project / "unexpected.md").unlink()
-
-            template_path = root / "templates/project.example.json"
-            template = json.loads(template_path.read_text())
-            template["messaging_transports"] = ["unreviewed"]
-            template_path.write_text(json.dumps(template))
-            result = audit.audit(root)
-            self.assertFalse(result["ok"])
-            self.assertIn("template:transport", result["findings"])
-
-    def test_audit_rejects_a_catalogue_promising_unusable_phases(self):
-        """enum_description is label text, so only the audit can catch a contradictory one."""
+    def test_private_registration_audit_accepts_generic_names_and_legacy_keys(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             for relative in CORE_COPY:
@@ -112,32 +60,50 @@ class PublicationTests(unittest.TestCase):
                 (project / name).write_text("private adapter")
             config = {
                 "schema_version": 1, "agenthub_version": hub.VERSION, "project_id": "audit_project",
-                "devices": {"authority": {}}, "agents": {"administrator": {"roles": ["administrator"], "devices": ["authority"]}},
-                "state_authority": {"host": "authority", "database": str(root / "private-state.db"), "policy": "single_authority_local"},
+                "devices": {"windows": {}},
+                "agents": {"administrator": {"roles": ["administrator"], "devices": ["windows"]}},
+                "state_authority": {"host": "windows", "database": str(root / "private-state.db"),
+                                    "policy": "single_authority_local"},
                 "execution": {"repository": str(root / "repository"), "worktree_root": str(root / "worktrees")},
                 "messaging_transports": [], "lark_workflow": "hard_disabled",
                 "task_naming": {
-                    "task_pattern": r"(?P<phase>P\d\d)-(?P<domain>[A-Z]+)-(?P<type>[A-Z]+)-(?P<seq>\d{3})",
+                    "task_pattern": r"TASK-(?P<seq>\d{3})",
                     "chain_pattern": r"CHN-(?P<seq>\d{4})", "seq_digits": 3,
-                    "enum_description": {"PHASE": "P00-P02/P99", "DOMAIN": "GOV/TASK/SEC/DATA",
-                                         "TYPE": "FIX/AUDIT/FEAT"},
-                    "phase_domains": {"P00": ["GOV", "TASK", "SEC"], "P99": ["GOV", "TASK", "SEC"]},
-                    "domain_types": {"GOV": ["FIX", "AUDIT"], "TASK": ["FIX", "AUDIT", "FEAT"], "SEC": ["FIX", "AUDIT"]},
+                    "enum_description": {"PHASE": "ignored"},
+                    "phase_domains": {"P00": ["GOV"]},
+                    "domain_types": {"GOV": ["FIX"]},
                 },
             }
             (project / "project.json").write_text(json.dumps(config))
-            findings = audit.audit(root)["findings"]
-            self.assertIn("naming:phase:projects/audit_project/project.json:['P01', 'P02']", findings)
-            self.assertIn("naming:domain:projects/audit_project/project.json:['DATA']", findings)
+            result = audit.audit(root)
+            self.assertTrue(result["ok"], result["findings"])
+            self.assertEqual(result["projects"], 1)
+            (project / ".zcode" / "plans").mkdir(parents=True)
+            (project / ".zcode" / "plans" / "plan.md").write_text("local plan")
+            (project / "__pycache__").mkdir()
+            (project / "__pycache__" / "cache.pyc").write_bytes(b"cache")
+            (project / ".DS_Store").write_bytes(b"metadata")
+            self.assertTrue(audit.audit(root)["ok"])
+            (project / "unexpected.md").write_text("real mirror")
+            result = audit.audit(root)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["findings"], ["mirror:unexpected:projects/audit_project/unexpected.md"])
+            (project / "unexpected.md").unlink()
 
-            config["task_naming"]["enum_description"]["PHASE"] = "P00/P99"
-            config["task_naming"]["enum_description"]["DOMAIN"] = "GOV/TASK/SEC"
-            config["task_naming"]["seq_offset"] = 0
-            (project / "project.json").write_text(json.dumps(config))
+            template_path = root / "templates/project.example.json"
+            template = json.loads(template_path.read_text())
+            template["phase_domains"] = {"P00": ["GOV"]}
+            template_path.write_text(json.dumps(template))
             findings = audit.audit(root)["findings"]
-            self.assertNotIn("naming:phase:projects/audit_project/project.json:[]", findings)
-            self.assertEqual([item for item in findings if item.startswith("naming:")],
-                             ["naming:seq-offset-ignored:projects/audit_project/project.json"])
+            self.assertIn("template:legacy-key:phase_domains", findings)
+
+    def test_spec_lists_the_public_command_surface(self):
+        text = (ROOT / "docs" / "SPEC.md").read_text(encoding="utf-8")
+        for name in hub.PUBLIC_COMMANDS:
+            self.assertIn(f"`{name}`", text)
+        self.assertNotIn("| `init`", text)
+        self.assertNotIn("| `claim-next`", text)
+        self.assertNotIn("| `rpc`", text)
 
     def test_redaction_and_credential_detection(self):
         token = "ghp_" + "A" * 36
@@ -172,6 +138,16 @@ class PublicationTests(unittest.TestCase):
         del files["README.md"]
         self.assertIn("path:missing:README.md", release.validate_files(files))
 
+    def test_manifest_matches_the_intended_public_surface(self):
+        manifest = set(release.load_manifest((ROOT / "release-files.json").read_bytes()))
+        for required in ("agent_hub.py", "docs/SPEC.md", "tests/support.py",
+                         "tests/test_cli.py", "tests/test_migration.py"):
+            self.assertIn(required, manifest)
+        self.assertNotIn("docs/CONTROL_PLANE_OPERATING_STANDARD.md", manifest)
+        self.assertNotIn("tests/test_agenthub.py", manifest)
+        self.assertNotIn("tests/test_contract_extensions.py", manifest)
+        self.assertNotIn("tests/test_dual_role.py", manifest)
+
     def test_manifest_forbids_instance_registration_and_traversal(self):
         for name in ("projects/private/project.json", "../outside.txt"):
             with self.assertRaises(ValueError):
@@ -180,8 +156,10 @@ class PublicationTests(unittest.TestCase):
     def test_history_scan_finds_secret_removed_from_head(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+
             def git(*args):
                 return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
             git("init", "-b", "main")
             git("config", "user.name", "AgentHub Test")
             git("config", "user.email", "agenthub@example.invalid")

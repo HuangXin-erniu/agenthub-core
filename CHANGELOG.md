@@ -1,5 +1,39 @@
 # Changelog
 
+## 2.4.5 — 2026-10-30
+
+### Breaking
+
+- The public command surface is now 18 commands. `init` and `claim-next` are removed; every command opens or migrates state. `claim <agent> [task_id]` claims a named task, or the next available task when the ID is omitted. `rpc` is a hidden transport interface.
+- Every command defaults to one JSON envelope: `{"ok": true, "data": ...}` on success and `{"ok": false, "error": {"code": ..., "message": ...}}` on stderr. `--text` renders a human view; `--json` is a hidden no-op for older scripts. Warnings are returned in `data.warnings`, not written as a second stderr JSON object.
+- Task contracts use the 2.0 field set. Required: `id`, `title`, `objective`, `assignee`, `decision_key`, `base_commit`, `instructions`, `acceptance`, `allowed_paths`. Optional: `forbidden_paths`, `depends_on`, `gates`, `artifacts`, `allow_path_overlap`, `priority`, `chain_id`. `scope`, `constraints`, `validation`, `deliverables`, `evidence_requirements`, `blocked_protocol` and `context_budget` are no longer accepted on new contracts; migrated contracts keep them under `contract.legacy`.
+- Database schema is 5. `tasks` is 26 columns; `contract_json` is the contract source and `submissions` is the execution-result source. `tasks.result_json` and the nine list columns are removed. Schema 4 is migrated automatically after a `state.db.v4-<UTC timestamp>.bak` backup. Schema 5 is not readable by 2.4.3; restore the backup to downgrade.
+- `status` and `show` restrict an Agent with `executor` and no review role to its own tasks. An Agent with `decider` or `administrator` sees all tasks.
+- `context` no longer returns the `overview` list or a full `tasks` array. It returns one `focus` packet, `review_queue`, `counts`, recent `decisions`, `excluded` and concurrency information. Use `status` for the task list.
+- `--config`, `--project` or `AGENTHUB_PROJECT` must select a registration. The old single-project inference is removed.
+
+### Added
+
+- Stable error codes and `--text` rendering for every public command. `--version` prints the runtime version without loading configuration.
+- `tasks.contract_json`, `tasks.approved_submission_id`, `execution.max_active_tasks_per_executor` (1-32, default 1) and `execution.max_contract_bytes` (4096-65536, default 16384).
+- Automatic schema 4 to 5 migration with a SQLite backup, foreign-key check and synthetic submission preservation when an old `result_json` has no history.
+- `audit --entity` and `audit --action` filters; `show --submissions N` (default 3, maximum 50).
+
+### Changed
+
+- Concurrency is one numeric setting. `execution.concurrency` is obsolete and ignored, except that `multiple_tasks_per_executor` without `max_active_tasks_per_executor` is rejected rather than silently reduced to one.
+- `task_naming` is a generic pattern/sequence policy. The core no longer interprets `phase`, `domain` or `type`; `enum_description`, `phase_domains` and `domain_types` are ignored.
+- `docs/SPEC.md` is the single mechanism specification. README files are quickstarts; the control-plane operating-standard document is folded into the specification. The runtime version is no longer repeated in README, SECURITY, registration or template titles.
+- Tests share `tests/support.py`; the old fixture module and the `claim-next`/`init` cases are removed. Cross-version tests are replaced with schema migration and v4-backup rollback tests.
+
+### Removed
+
+- `init`, `claim-next`, the old contract prose fields, `execution.concurrency`, `execution.isolation`, `task_naming.enum_description`, `task_naming.phase_domains`, `task_naming.domain_types`, `agenthub_version`, `project_name`, `workflow`, `messaging_transports` and `lark_workflow` from the canonical template. Older registrations that still contain these optional keys load, but the keys are ignored.
+
+### Upgrade notes
+
+Back up SQLite state in an SQLite-aware way before the first 2.4.5 command. The first command migrates schema 4 to 5 and writes `<state>.v4-<UTC timestamp>.bak`; keep that backup until the new state is proven. Schema 5 cannot be opened by 2.4.3. Remove the obsolete registration keys and update role instructions that mention `init` or `claim-next`. This release does not deploy or migrate any private project automatically.
+
 ## 2.4.3 — 2026-10-26
 
 ### Added

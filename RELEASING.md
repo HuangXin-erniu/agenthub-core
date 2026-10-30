@@ -4,25 +4,22 @@ A release is an annotated Git tag plus a GitHub Release. Pushing a commit is not
 
 ## Version scheme
 
-- Use `MAJOR.MINOR.PATCH`; the tag is `v` followed by the version, for example `v2.4.1`.
-- `agent_hub.py` `VERSION` is the source of truth. It must agree with:
-  - `templates/project.example.json` `agenthub_version`
-  - the `README.md` and `README.zh-CN.md` titles
-  - `SECURITY.md`
-  - the `docs/PROJECT_REGISTRATION.md` title
-  - a matching `CHANGELOG.md` section
-  - every private registration's `agenthub_version` when that registration is upgraded
-- Configuration schema and database schema are versioned separately. State any compatibility impact in the changelog and upgrade notes.
+- Use `MAJOR.MINOR.PATCH`; the tag is `v` followed by the version, for example `v2.4.5`.
+- `agent_hub.py` `VERSION` is the source of truth. It must agree with a matching
+  `CHANGELOG.md` section `## X.Y.Z — YYYY-MM-DD`. README, SECURITY, registration docs
+  and the template do not repeat the version.
+- Configuration schema and database schema are versioned separately. State any
+  compatibility impact in the changelog and upgrade notes.
 
-The structural audit fails when these surfaces drift, so a partial version bump is detected before release.
+The structural audit fails when `VERSION` has no matching changelog section.
 
 ## Release commit
 
 1. Start from a clean `main` whose CI passed.
-2. Bump the version in every file listed above.
-3. Add a `CHANGELOG.md` section `## X.Y.Z — YYYY-MM-DD` with `Added`, `Fixed`, `Changed` and `Upgrade notes` as needed.
-4. Update `release-files.json` when the public file set changes.
-5. Run:
+2. Bump `VERSION` and add a `CHANGELOG.md` section `## X.Y.Z — YYYY-MM-DD` with
+   `Breaking`, `Added`, `Fixed`, `Changed`, `Removed` and `Upgrade notes` as needed.
+3. Update `release-files.json` when the public file set changes.
+4. Run:
 
    ```sh
    python3 scripts/audit_agenthub.py
@@ -32,13 +29,15 @@ The structural audit fails when these surfaces drift, so a partial version bump 
    ```
 
    In a development checkout that contains private registrations, run the audit, tests and working-tree release scan in an isolated core copy; use `--staged` or `--history` for the real checkout.
-6. Commit with `Release AgentHub Core X.Y.Z`.
+5. Commit with `Release AgentHub Core X.Y.Z`, push `main`, and wait for CI on that
+   commit to pass before tagging.
 
 ## Tag and GitHub Release
 
 ```sh
-git tag -a vX.Y.Z -m "AgentHub Core vX.Y.Z: <one-line summary>" HEAD
 git push origin main
+# wait for CI on that commit to pass
+git tag -a vX.Y.Z -m "AgentHub Core vX.Y.Z: <one-line summary>" HEAD
 git push origin vX.Y.Z
 ```
 

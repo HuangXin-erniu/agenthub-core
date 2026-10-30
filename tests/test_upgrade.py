@@ -1,25 +1,14 @@
-"""Upgrade behaviour: the deploy's safety properties, and a task surviving a version change.
-
-The deployment replaces managed files one at a time, so its ordering *is* the contract and is
-asserted here rather than trusted. The cross-version tests take the runtime from the previous
-release out of git history and drive both halves of one task with it, which is what makes
-"upgrading does not disturb work in progress" a checked claim instead of an assurance.
-"""
+"""Deployment ordering tests for the isolated release tooling."""
 from __future__ import annotations
 
 import importlib.util
 import json
-import sqlite3
 import subprocess
-import sys
 import unittest
 from pathlib import Path
 from unittest import mock
 
-import test_agenthub as fixtures
-
 ROOT = Path(__file__).resolve().parents[1]
-hub = fixtures.hub
 
 
 def load(name: str, relative: str):
@@ -72,7 +61,6 @@ def line_of(lines: list[str], predicate, last: bool = False) -> int:
 
 class DeployScriptTests(unittest.TestCase):
     def test_activation_verifies_every_file_before_replacing_any(self):
-        """A corrupt transfer must not be able to replace even one file."""
         lines = posix_activation().splitlines()
         last_check = line_of(lines, lambda l: "sha256sum" in l and "hash mismatch" in l, last=True)
         first_move = line_of(lines, lambda l: l.strip().startswith("mv -f"))
@@ -82,7 +70,6 @@ class DeployScriptTests(unittest.TestCase):
             self.assertIn(f"hash mismatch: {entry['stage']}", posix_activation())
 
     def test_activation_makes_the_launcher_executable_before_moving_it(self):
-        """The remote proxy runs ./agenthub.sh; a launcher landing 0644 breaks every command."""
         lines = posix_activation().splitlines()
         chmod = line_of(lines, lambda l: l.startswith("chmod 755") and deploy.STAGING_NAME in l)
         first_move = line_of(lines, lambda l: l.strip().startswith("mv -f"))
@@ -91,7 +78,7 @@ class DeployScriptTests(unittest.TestCase):
 
     def test_activation_keeps_the_generation_it_replaces(self):
         lines = posix_activation().splitlines()
-        keep = [index for index, line in enumerate(lines) if line.startswith(f"[ -f ") and "cp -f --" in line]
+        keep = [index for index, line in enumerate(lines) if line.startswith("[ -f ") and "cp -f --" in line]
         first_move = line_of(lines, lambda l: l.strip().startswith("mv -f"))
         self.assertEqual(len(keep), len(entries_fixture()))
         self.assertLess(max(keep), first_move)
@@ -106,7 +93,6 @@ class DeployScriptTests(unittest.TestCase):
         self.assertIn(f"cp -f -- {PREVIOUS}/00-agent_hub.py", failure)
         self.assertIn("chmod 755", failure)
         self.assertIn("exit 1", failure)
-        # the staged copy is kept for inspection, so the removal happens only on success
         self.assertLess(script.index("restoring the previous generation"),
                         script.index(f"rm -rf -- {STAGING}"))
 
@@ -148,16 +134,20 @@ class DeployScriptTests(unittest.TestCase):
             self.skipTest("no private registration in this checkout")
         runtime, deployed_config = deploy.self_check_targets(
             project_dir,
-            [{"stage": "00", "source": ROOT / "agent_hub.py", "destination": ".agenthub/agent_hub.py", "sha256": "a" * 64},
-             {"stage": "01", "source": project_dir / "project.json", "destination": ".agenthub/project.json", "sha256": "b" * 64}])
+            [{"stage": "00", "source": ROOT / "agent_hub.py",
+              "destination": ".agenthub/agent_hub.py", "sha256": "a" * 64},
+             {"stage": "01", "source": project_dir / "project.json",
+              "destination": ".agenthub/project.json", "sha256": "b" * 64}])
         self.assertEqual(runtime, ".agenthub/agent_hub.py")
         self.assertEqual(deployed_config, ".agenthub/project.json")
         unmatched = deploy.self_check_targets(project_dir, [
-            {"stage": "00", "source": ROOT / "README.md", "destination": ".agenthub/README.md", "sha256": "a" * 64}])
+            {"stage": "00", "source": ROOT / "README.md",
+             "destination": ".agenthub/README.md", "sha256": "a" * 64}])
         self.assertEqual(unmatched, ("", ""))
 
     def test_inflight_tasks_warn_by_default_and_can_be_required_to_be_idle(self):
-        inflight = [{"task_id": "T-1", "status": "in_progress", "assignee": "worker_a", "claimed_by": "worker_a"}]
+        inflight = [{"task_id": "T-1", "status": "in_progress",
+                     "assignee": "worker_a", "claimed_by": "worker_a"}]
         self.assertEqual(deploy.enforce_idle(None, False), "")
         self.assertEqual(deploy.enforce_idle([], True), "")
         self.assertIn("T-1(in_progress)", deploy.enforce_idle(inflight, False))
@@ -186,117 +176,6 @@ class DeployScriptTests(unittest.TestCase):
             tasks, note = deploy.active_tasks("authority", "/state.db")
             self.assertIsNone(tasks)
             self.assertEqual(note, "ssh failed")
-
-
-def previous_runtime_source() -> str | None:
-    """`agent_hub.py` as of the release before the checked-out one, or None without history."""
-    revisions = subprocess.run(["git", "-C", str(ROOT), "log", "--format=%H", "--", "agent_hub.py"],
-                               capture_output=True, text=True, encoding="utf-8", check=False)
-    hashes = revisions.stdout.split()
-    if revisions.returncode or len(hashes) < 2:
-        return None
-    blob = subprocess.run(["git", "-C", str(ROOT), "show", f"{hashes[1]}:agent_hub.py"],
-                          capture_output=True, text=True, encoding="utf-8", check=False)
-    return blob.stdout if blob.returncode == 0 and blob.stdout else None
-
-
-class CrossVersionTests(unittest.TestCase):
-    setUp = fixtures.AgentHubV23Tests.setUp
-    tearDown = fixtures.AgentHubV23Tests.tearDown
-    git = fixtures.AgentHubV23Tests.git
-    call = fixtures.AgentHubV23Tests.call
-    decide = fixtures.AgentHubV23Tests.decide
-    packet = fixtures.AgentHubV23Tests.packet
-
-    def previous_runtime(self) -> Path:
-        source = previous_runtime_source()
-        if source is None:
-            self.skipTest("no earlier revision of agent_hub.py in this checkout")
-        path = self.root / "previous_agent_hub.py"
-        path.write_text(source, encoding="utf-8")
-        return path
-
-    def run_previous(self, runtime: Path, *args: str) -> str:
-        result = subprocess.run(
-            [sys.executable, str(runtime), *self.base, *args],
-            capture_output=True, text=True, encoding="utf-8", check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return result.stdout
-
-    def test_a_task_claimed_under_the_previous_runtime_finishes_under_this_one(self):
-        """The upgrade case: the runtime file is swapped while a task is in flight."""
-        runtime = self.previous_runtime()
-        self.decide()
-        self.run_previous(runtime, "--device", "client_primary", "post", "admin_agent", "--spec", self.packet("T-UP"))
-        claimed = json.loads(self.run_previous(runtime, "--device", "authority", "claim", "worker_a", "T-UP"))
-        worktree = Path(claimed["worktree_path"])
-        self.assertEqual(claimed["status"], "in_progress")
-        self.assertTrue((worktree / ".git").exists())
-        self.run_previous(runtime, "--device", "authority", "checkpoint", "worker_a", "T-UP",
-                          "--progress", json.dumps({"summary": "started on the old runtime",
-                                                    "next_step": "finish", "evidence": []}))
-
-        # the swap, exactly as the adapter performs it: new runtime bytes over the old file
-        first = json.loads(self.call("--device", "authority", "next", "worker_a"))["task"]
-        self.assertEqual(first["status"], "in_progress")
-        self.assertEqual(first["checkpoint"]["summary"], "started on the old runtime")
-
-        (worktree / "README.md").write_text("base\ncompleted after the upgrade\n", encoding="utf-8")
-        self.git("add", "README.md", cwd=worktree)
-        self.git("commit", "-m", "finish after upgrade", cwd=worktree)
-        commit = self.git("rev-parse", "HEAD", cwd=worktree)
-        result = json.dumps({"outcome": "completed", "summary": "finished on the new runtime",
-                             "commit": commit, "tests": ["upgrade"], "evidence": [f"commit:{commit}"]})
-        self.call("--device", "authority", "submit", "worker_a", "T-UP", "--result", result)
-        self.call("--device", "client_primary", "review", "planner_agent", "T-UP", "--action", "approve", "--note", "ok")
-        self.git("merge", "--ff-only", "agenthub/T-UP")
-        self.call("--device", "client_primary", "close", "admin_agent", "T-UP",
-                  "--merge-commit", self.git("rev-parse", "HEAD"), "--target-branch", "main", "--note", "upgraded")
-
-        shown = json.loads(self.call("--device", "client_primary", "show", "admin_agent", "T-UP"))
-        self.assertEqual(shown["task"]["status"], "closed")
-        self.assertFalse(worktree.exists())
-        conn = sqlite3.connect(self.state)
-        try:
-            metadata = dict(conn.execute("SELECT key,value FROM metadata"))
-            events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-        finally:
-            conn.close()
-        self.assertEqual(metadata["schema_version"], "4")
-        self.assertEqual(metadata["agenthub_version"], hub.VERSION)
-        self.assertGreaterEqual(events, 6)
-
-    def test_the_previous_runtime_can_still_read_state_this_one_wrote(self):
-        """Downgrade compatibility: the schema policy is additive, and this is what checks it."""
-        runtime = self.previous_runtime()
-        self.decide()
-        self.call("--device", "client_primary", "post", "admin_agent", "--spec", self.packet("T-DOWN"))
-        self.call("--device", "authority", "claim", "worker_a", "T-DOWN")
-        shown = json.loads(self.run_previous(runtime, "--device", "client_primary", "show", "admin_agent", "T-DOWN"))
-        self.assertEqual(shown["task"]["status"], "in_progress")
-        status = json.loads(self.run_previous(runtime, "--device", "client_primary", "status", "admin_agent", "--json"))
-        self.assertEqual([task["id"] for task in status["tasks"]], ["T-DOWN"])
-
-    def test_the_previous_runtime_can_read_state_with_two_tasks_in_progress(self):
-        """A newer executor can hold several tasks while an older runtime still reads them."""
-        runtime = self.previous_runtime()
-        config = json.loads(self.config.read_text(encoding="utf-8"))
-        config["execution"]["concurrency"] = "multiple_tasks_per_executor"
-        config["execution"]["max_active_tasks_per_executor"] = 2
-        self.config.write_text(json.dumps(config), encoding="utf-8")
-
-        self.decide()
-        self.run_previous(runtime, "--device", "client_primary", "post", "admin_agent", "--spec", self.packet("T-ONE"))
-        self.run_previous(runtime, "--device", "authority", "claim", "worker_a", "T-ONE")
-        self.call("--device", "client_primary", "post", "admin_agent", "--spec", self.packet("T-TWO"))
-        claimed = json.loads(self.call("--device", "authority", "claim", "worker_a", "T-TWO"))
-        self.assertEqual(claimed["status"], "in_progress")
-
-        shown = json.loads(self.run_previous(runtime, "--device", "client_primary", "show", "admin_agent", "T-ONE"))
-        self.assertEqual(shown["task"]["status"], "in_progress")
-        status = json.loads(self.run_previous(runtime, "--device", "client_primary", "status", "admin_agent", "--json"))
-        self.assertEqual(sorted(task["id"] for task in status["tasks"]), ["T-ONE", "T-TWO"])
 
 
 if __name__ == "__main__":

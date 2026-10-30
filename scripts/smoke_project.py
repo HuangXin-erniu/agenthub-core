@@ -53,14 +53,14 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="agenthub-smoke-") as temp_raw:
         temp = Path(temp_raw)
         project = temp / "repository"
-        subprocess.run(["git", "clone", "--no-hardlinks", "--", str(source_project), str(project)], check=True, capture_output=True)
+        subprocess.run(["git", "clone", "--no-hardlinks", "--", str(source_project), str(project)],
+                       check=True, capture_output=True)
         worktree_root = temp / "worktrees"
         state = temp / "state.db"
         config_path = temp / "project.json"
         config = json.loads(json.dumps(source_config))
         config["execution"]["repository"] = str(project)
         config["execution"]["worktree_root"] = str(worktree_root)
-        # Test generic lifecycle separately from private naming catalogues.
         config.pop("task_naming", None)
         config["state_authority"]["database"] = str(state)
         config.setdefault("remote", {})["enabled"] = False
@@ -70,31 +70,32 @@ def main() -> int:
             capture_output=True, text=True, encoding="utf-8",
         ).stdout.strip()
 
-        def call(*call_args: str) -> str:
+        def call(*call_args: str) -> dict:
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 code = hub.run(["--local", "--config", str(config_path), "--state", str(state), *call_args])
             if code:
                 raise RuntimeError(f"AgentHub returned {code}: {call_args}")
-            return output.getvalue()
+            payload = json.loads(output.getvalue())
+            if not payload.get("ok"):
+                raise RuntimeError(payload)
+            return payload["data"]
 
         worktree: Path | None = None
         try:
-            call("--device", admin_device, "decision", administrator, "--key", "SMOKE-D", "--summary", "route", "--rationale", "AgentHub smoke")
+            call("--device", admin_device, "decision", administrator, "--key", "SMOKE-D",
+                 "--summary", "route", "--rationale", "AgentHub smoke")
             packet = json.dumps({
                 "id": task_id, "title": "AgentHub smoke", "objective": "validate configured project flow",
                 "assignee": executor, "decision_key": "SMOKE-D", "base_commit": base,
-                "scope": ["read-only flow"], "instructions": ["do not edit business files"],
-                "constraints": ["temporary state only"], "allowed_paths": ["AGENTS.md"],
-                "forbidden_paths": [".agenthub/**"], "acceptance": ["handoff enforced"],
-                "validation": ["runtime works from task worktree"], "deliverables": ["smoke output"],
-                "evidence_requirements": ["checkpoint"],
-                "blocked_protocol": "submit blocker and decision_needed", "context_budget": 6000,
+                "instructions": ["do not edit business files"], "allowed_paths": ["AGENTS.md"],
+                "acceptance": ["handoff enforced"],
             }, ensure_ascii=False)
             call("--device", admin_device, "post", administrator, "--spec", packet)
-            claimed = json.loads(call("--device", authority_device, "--session", session, "claim", executor, task_id))
-            worktree = Path(claimed["worktree_path"])
-            call("--device", authority_device, "--session", session, "heartbeat", executor, task_id, "--lease-minutes", "1")
+            claimed = call("--device", authority_device, "--session", session, "claim", executor, task_id)
+            worktree = Path(claimed["task"]["worktree_path"])
+            call("--device", authority_device, "--session", session, "heartbeat", executor, task_id,
+                 "--lease-minutes", "1")
             launch = subprocess.run(
                 [sys.executable, str(runtime), "--local", "--config", str(config_path), "--state", str(state),
                  "--device", authority_device, "--session", session, "next", executor],
@@ -103,23 +104,28 @@ def main() -> int:
             if launch.returncode:
                 raise RuntimeError(f"worktree runtime failed: {launch.stderr}")
             progress = json.dumps({"summary": "safe", "next_step": "handoff", "evidence": []})
-            call("--device", authority_device, "--session", session, "checkpoint", executor, task_id, "--progress", progress)
+            call("--device", authority_device, "--session", session, "checkpoint", executor, task_id,
+                 "--progress", progress)
             try:
-                call("--device", target_device, "--session", session, "checkpoint", executor, task_id, "--progress", progress)
+                call("--device", target_device, "--session", session, "checkpoint", executor, task_id,
+                     "--progress", progress)
             except hub.HubError:
                 pass
             else:
                 raise RuntimeError("non-active device checkpoint was not rejected")
-            call("--device", authority_device, "--session", session, "handoff", executor, task_id, "--to-device", target_device, "--note", "smoke")
-            call("--device", target_device, "--session", session, "checkpoint", executor, task_id, "--progress", progress)
+            call("--device", authority_device, "--session", session, "handoff", executor, task_id,
+                 "--to-device", target_device, "--note", "smoke")
+            call("--device", target_device, "--session", session, "checkpoint", executor, task_id,
+                 "--progress", progress)
             blocked = json.dumps({
                 "outcome": "blocked", "summary": "smoke blocker",
                 "blocker": "intentional", "decision_needed": "confirm history",
             })
             call("--device", target_device, "--session", session, "submit", executor, task_id, "--result", blocked)
-            shown = json.loads(call("--device", admin_device, "show", administrator, task_id))
+            shown = call("--device", admin_device, "show", administrator, task_id)
             assert shown["submissions"][0]["result"]["decision_needed"] == "confirm history"
-            call("--device", decider_device, "review", decider, task_id, "--action", "rework", "--note", "history verified")
+            call("--device", decider_device, "review", decider, task_id, "--action", "rework",
+                 "--note", "history verified")
             print(json.dumps({
                 "ok": True, "project": config["project_id"], "task": task_id,
                 "authority_device": authority_device, "handoff_device": target_device,
@@ -128,7 +134,8 @@ def main() -> int:
             }, ensure_ascii=False))
         finally:
             if worktree and worktree.exists():
-                subprocess.run(["git", "-C", str(project), "worktree", "remove", "--force", str(worktree)], check=False)
+                subprocess.run(["git", "-C", str(project), "worktree", "remove", "--force", str(worktree)],
+                               check=False)
             subprocess.run(["git", "-C", str(project), "branch", "-D", branch], check=False, capture_output=True)
     return 0
 
