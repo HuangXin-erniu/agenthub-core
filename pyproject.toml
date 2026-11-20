@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenthub-core"
+dynamic = ["version"]
+description = "A lightweight, decision-first control plane for AI-agent collaboration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.scripts]
+agenthub = "agent_hub:main"
+
+[tool.setuptools]
+py-modules = ["agent_hub"]
+
+[tool.setuptools.dynamic]
+version = {attr = "agent_hub.VERSION"}

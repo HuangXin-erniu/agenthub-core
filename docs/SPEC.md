@@ -71,7 +71,9 @@ A task keeps at most one active device. Concurrency is bounded by
 
 ## 4. Command-line contract
 
-Global options must precede the command:
+Global options must precede the command. The installed `agenthub` entry point and
+`python agent_hub.py` use the same CLI. Pass an explicit `--config FILE` when
+using the installed entry point with a private registration.
 
 ```text
 agent_hub.py [--project ID] [--config FILE] [--state FILE] [--device ID]
@@ -89,7 +91,7 @@ internal/trusted interfaces and are not part of the public command table.
 | `context` | Unified workbench: focus packet, review queue, counts, recent decisions |
 | `next` | Return the next execution focus; `--available` restricts to unclaimed work |
 | `show` | Full task packet plus recent submissions; `--submissions N` (0-50) |
-| `post` | Publish an immutable task contract |
+| `post` | Publish an immutable task contract; `--dry-run` validates it before publishing |
 | `claim` | Claim a named task, or the next available task when the ID is omitted |
 | `release` | Return an in-progress task to ready; `--if-expired` requires an expired lease |
 | `handoff` | Move the active device after a current checkpoint |
@@ -130,6 +132,13 @@ Warnings are data, not a second output stream:
 ```json
 {"ok": true, "data": {"warnings": [{"code": "path.overlap.ack", "message": "..."}]}}
 ```
+
+`post <agent> --spec @task.json --dry-run` uses the same permissions and checks as `post`
+against a read-only snapshot of the authority database. It requires an initialized
+schema 5 database. If initialization or migration is needed, use an ordinary
+authority command first. A successful preflight returns `id`, `dry_run: true` and
+`warnings`. The ordinary `post` checks the current state again in its write
+transaction before creating the task and recording the publication event.
 
 ### 4.3 Error codes
 
@@ -304,6 +313,13 @@ supported rollback path.
 
 - A claim records `--session`. `checkpoint`, `submit`, `handoff` and `release` reject
   another window of the same executor identity.
+- `status --mine` includes the active device and session in text output. `show`,
+  `next` and `context` show the authority worktree, current checkpoint and its
+  next step. After the old window stops, use the recorded session and device to
+  resume. To change devices, checkpoint then hand off from the active device and
+  continue on the returned `to_device`, using `session` when the claim has one.
+- An executor's `release` must come from the active device. An administrator can
+  still release another executor's claim.
 - `execution.session_policy=required` makes a session mandatory for `claim`; an
   unbound legacy claim must be bound once with `heartbeat --session <id>`.
 - `next`/`context` with a session show that session's work first, then unclaimed
@@ -327,7 +343,7 @@ supported rollback path.
 
 ## 10. Version and documentation policy
 
-- `agent_hub.py` `VERSION` is the runtime source of truth.
+- `agent_hub.py` `VERSION` is the runtime and wheel metadata source of truth.
 - `CHANGELOG.md` must contain `## <VERSION> —` for the current runtime.
 - README, project registration docs, SECURITY and templates do not repeat the version.
 - `release-files.json` is the exact public file allowlist. The release scanner checks

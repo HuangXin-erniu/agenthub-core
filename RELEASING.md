@@ -1,6 +1,6 @@
 # Releasing AgentHub Core
 
-A release is an annotated Git tag plus a GitHub Release. Pushing a commit is not a release, and a tag without a GitHub Release is only half the record.
+A release consists of an annotated Git tag and a GitHub Release containing the Python wheel.
 
 ## Version scheme
 
@@ -41,13 +41,17 @@ git tag -a vX.Y.Z -m "AgentHub Core vX.Y.Z: <one-line summary>" HEAD
 git push origin vX.Y.Z
 ```
 
-Create a GitHub Release whose title is `AgentHub Core vX.Y.Z` and whose notes are the matching `CHANGELOG.md` section:
+Build the universal wheel from a clean checkout of the tag using `python -m build --wheel`
+with the PyPA `build` package. Verify the installed CLI version and attach the wheel to a
+GitHub Release titled `AgentHub Core vX.Y.Z`, using the matching `CHANGELOG.md` section for
+the notes.
 
 ```sh
-gh release create vX.Y.Z --title "AgentHub Core vX.Y.Z" --notes-file /tmp/notes-X.Y.Z.md
+gh release create vX.Y.Z dist/agenthub_core-X.Y.Z-py3-none-any.whl --verify-tag --title "AgentHub Core vX.Y.Z" --notes-file /tmp/notes-X.Y.Z.md
 ```
 
 - Use annotated tags only. Never move, delete or force-push a published tag.
+- For historical releases, attach a wheel only if the tagged source supports building one.
 - The newest release is `Latest`. When backfilling an older version, pass `--latest=false` so the current release keeps the flag.
 - Keep the release notes factual and identical in intent to the changelog. For a version that predates the changelog, write a short summary from the commit and README.
 

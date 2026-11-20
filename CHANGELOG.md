@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.4.6 — 2026-11-20
+
+### Added
+
+- `post --dry-run` validates a contract against a read-only snapshot of the authority's schema 5 database. It uses the same rules and warnings as `post`; publication checks them again in its write transaction.
+- GitHub Releases can distribute a pure Python wheel with an `agenthub` entry point. Install or upgrade with a package tool such as `uv`, and pass the existing private registration through `--config`.
+
+### Changed
+
+- `--text status` shows the device and session for in-progress tasks. The `show`, `next` and `context` text views include the authority worktree and the next step from the current claim's checkpoint. `handoff` returns the target device and session.
+- An executor can release their claim only from its active device. Administrators retain the ability to release another executor's claim.
+
+### Upgrade notes
+
+Existing 2.4.5 registrations and schema 5 databases work with the new runtime. Update the authority runtime before using `post --dry-run` through SSH. Installing the wheel updates only the local CLI.
+
 ## 2.4.5 — 2026-10-30
 
 ### Breaking

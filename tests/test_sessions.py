@@ -63,6 +63,46 @@ class SessionTests(HubFixture):
         shown = self.call("--device", "authority", "show", "worker_a", "T-1")
         self.assertEqual(shown["task"]["checkpoint"]["summary"], "half")
 
+    def test_resume_text_and_handoff_keep_the_original_session_and_worktree(self):
+        self.decide()
+        self.post()
+        session = "resume-window"
+        claimed = self.claim("T-1", session=session)["task"]
+        progress = json.dumps({"summary": "first step done", "next_step": "finish second step"})
+        self.call_session(session, "checkpoint", "worker_a", "T-1", "--progress", progress)
+
+        status = self.call_text("--device", "authority", "status", "worker_a", "--mine")
+        self.assertIn(f"device=authority session={session}", status)
+        for command in (("show", "worker_a", "T-1"), ("next", "worker_a"), ("context", "worker_a")):
+            view = self.call_text("--device", "authority", "--session", session, *command)
+            self.assertIn(f"worktree: {claimed['worktree_path']}", view)
+            self.assertIn("checkpoint: first step done", view)
+            self.assertIn("next step: finish second step", view)
+
+        handoff = self.call_session(session, "handoff", "worker_a", "T-1",
+                                    "--to-device", "client_secondary", "--note", "continue there")
+        self.assertEqual(handoff, {"task_id": "T-1", "from_device": "authority",
+                                  "to_device": "client_secondary", "session": session})
+        self.assertIn(f"client_secondary session={session}", hub.render_text("handoff", handoff))
+        resumed = self.call_session(session, "next", "worker_a", device=handoff["to_device"])["task"]
+        self.assertEqual(resumed["worktree_path"], claimed["worktree_path"])
+        self.assertEqual(resumed["claim_generation"], claimed["claim_generation"])
+        self.assertEqual(resumed["checkpoint"]["next_step"], "finish second step")
+
+        release_args = ("release", "worker_a", "T-1", "--reason", "old device")
+        error = self.call_error("--device", "authority", "--session", session, *release_args)
+        self.assertEqual(error.code, "task.state")
+        commit = self.commit_work("T-1")
+        result = json.dumps({"outcome": "completed", "summary": "done", "commit": commit,
+                             "tests": ["unit"], "evidence": [f"commit:{commit}"]})
+        submit = ("submit", "worker_a", "T-1", "--result", result)
+        error = self.call_error("--device", "authority", "--session", session, *submit)
+        self.assertEqual(error.code, "task.state")
+        error = self.call_error("--device", handoff["to_device"], "--session", "other-window", *submit)
+        self.assertEqual(error.code, "task.session")
+        completed = self.call_session(session, *submit, device=handoff["to_device"])
+        self.assertEqual(completed["status"], "review")
+
     def test_heartbeat_binds_legacy_claim_and_tracks_lease(self):
         self.decide()
         self.post()
