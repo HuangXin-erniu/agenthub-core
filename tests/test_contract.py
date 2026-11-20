@@ -28,6 +28,68 @@ class ContractTests(HubFixture):
         self.assertEqual(contract["priority"], 50)
         self.assertEqual(contract["chain_id"], "")
 
+    def test_post_dry_run_reuses_checks_and_leaves_state_unchanged(self):
+        self.state = self.root / "state # test.db"
+        self.decide()
+        self.post(self.packet("T-1"))
+        with self.open_state() as conn:
+            conn.execute("UPDATE metadata SET value='2.4.5' WHERE key='agenthub_version'")
+        conn.close()
+        state_before = self.state.read_bytes()
+        contract = self.root / "task to publish.json"
+        contract.write_text(json.dumps(self.packet("T-2")), encoding="utf-8")
+        args = ("--device", "client_primary", "post", "admin_agent", "--spec", f"@{contract}")
+
+        preview = self.call(*args, "--dry-run")
+        self.assertEqual(set(preview), {"id", "dry_run", "warnings"})
+        self.assertEqual(preview["id"], "T-2")
+        self.assertIs(preview["dry_run"], True)
+        self.assertEqual(preview["warnings"][0]["code"], "path.overlap.ack")
+        self.assertIn("预检通过 T-2", self.call_text(*args, "--dry-run"))
+        self.assertEqual(self.state.read_bytes(), state_before)
+        self.assertFalse(self.worktrees.exists())
+        self.assertEqual(git(self.repo, "branch", "--list", "agenthub/*"), "")
+
+        published = self.call(*args)
+        self.assertEqual(published, {"id": "T-2", "status": "ready", "warnings": preview["warnings"]})
+
+        candidate = self.packet("T-3", allowed_paths=["src/a.py"], allow_path_overlap=False)
+        args = ("--device", "client_primary", "post", "admin_agent", "--spec", json.dumps(candidate))
+        self.assertEqual(self.call(*args, "--dry-run")["warnings"], [])
+        self.post(self.packet("T-4", allowed_paths=["src/**"], allow_path_overlap=False))
+        self.assertEqual(self.call_error(*args).code, "path.overlap")
+
+    def test_post_dry_run_rejects_the_same_conflicts_as_post(self):
+        config = self.config_value()
+        config["task_naming"] = {"task_pattern": r"TASK-(?P<seq>\d{3})",
+                                 "chain_pattern": r"CHN-(?P<seq>\d{4})", "seq_digits": 3}
+        self.write_config(config)
+        self.decide()
+        valid = self.packet("TASK-001", chain_id="CHN-0001", allow_path_overlap=False)
+        self.post(valid)
+        candidate = valid | {"id": "TASK-002", "chain_id": "CHN-0002"}
+        for changes, code in (
+            ({"depends_on": ["TASK-999"]}, "dependency.unmet"),
+            ({"id": "TASK-003"}, "contract.invalid"),
+            ({}, "path.overlap"),
+        ):
+            with self.subTest(changes=changes):
+                args = ("--device", "client_primary", "post", "admin_agent",
+                        "--spec", json.dumps(candidate | changes))
+                preview = self.call_error(*args, "--dry-run")
+                publish = self.call_error(*args)
+                self.assertEqual((preview.code, preview.message), (code, publish.message))
+                self.assertEqual(publish.code, code)
+
+    def test_post_dry_run_requires_initialized_state_and_post_permission(self):
+        args = ("--spec", json.dumps(self.packet()), "--dry-run")
+        error = self.call_error("--device", "client_primary", "post", "admin_agent", *args)
+        self.assertEqual(error.code, "state.migration")
+        self.assertFalse(self.state.exists())
+        self.decide()
+        error = self.call_error("--device", "authority", "post", "worker_a", *args)
+        self.assertEqual(error.code, "identity.permission")
+
     def test_required_arrays_and_unknown_fields(self):
         self.decide()
         for field in ("instructions", "acceptance", "allowed_paths"):

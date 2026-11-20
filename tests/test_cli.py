@@ -11,7 +11,7 @@ class CliTests(HubFixture):
     def test_version_and_help_surface(self):
         result = self.cli("--version", config=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "AgentHub 2.4.5")
+        self.assertEqual(result.stdout.strip(), f"AgentHub {hub.VERSION}")
         help_result = self.cli("--help", config=False)
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         for name in hub.PUBLIC_COMMANDS:

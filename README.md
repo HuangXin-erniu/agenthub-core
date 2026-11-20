@@ -35,6 +35,18 @@ several roles and use one unified `context`. Self-review is allowed unless
 
 ## Quickstart
 
+Pick the wheel for the version you want from [GitHub Releases](https://github.com/HuangXin-erniu/agenthub-core/releases).
+Install it from a downloaded file or the asset URL. To update, run the same
+command with the new version's wheel.
+
+```sh
+uv tool install "<wheel path or release asset URL>"
+agenthub --version
+agenthub --config "<path to your private project.json>" --device <device_id> context <decider_agent_id>
+```
+
+From a source checkout, the equivalent commands use `python agent_hub.py`:
+
 ```sh
 python agent_hub.py --project <project_id> --device <device_id> context <decider_agent_id>
 python agent_hub.py --project <project_id> --device <device_id> next <executor_agent_id>
@@ -59,8 +71,8 @@ device. JSON arguments accept inline JSON or `@<file>` for `--spec`, `--progress
 | `cancel`, `supersede`, `prune` | Preserve cancellation/replacement and reclaim worktrees |
 
 `claim <agent> [task_id]` claims a named task, or the next available task when the ID
-is omitted. `init` and `claim-next` are removed in 2.4.5. Every command opens or
-migrates the state database; there is no separate initialization command.
+is omitted. Ordinary commands open or migrate the state database. `post --dry-run`
+requires an initialized schema 5 database and reads its current state.
 
 All commands print one JSON envelope (`{"ok": true, "data": ...}`) and use
 `{"ok": false, "error": {"code": ...}}` on stderr for domain errors. `--text` prints a
@@ -76,6 +88,7 @@ priority and `chain_id`.
 ```sh
 # decision and contract
 python agent_hub.py ... decision <admin> --key D-1 --summary "..." --rationale "..."
+python agent_hub.py ... post <admin> --spec @task.json --dry-run
 python agent_hub.py ... post <admin> --spec @task.json
 
 # execution
@@ -105,6 +118,12 @@ A claim records the caller-declared session. `checkpoint`, `submit`, `handoff` a
 claim must be bound once with `--session <id> heartbeat <executor> <task_id>`. A lease is advisory:
 expiry is reported but never releases work automatically.
 
+To resume after the old window stops, run `--text status <executor> --mine` to
+find the session and active device, then run `--device <device> --session <id> --text
+show <executor> <task_id>` for the worktree and next checkpoint step. To move to
+another device, run `checkpoint` and then `handoff` from the active device. In the
+receiving window, use `to_device` and pass `session` when the claim has one.
+
 The authority owns SQLite state and worktrees. Keep them outside synchronized
 folders; back up state separately. Schema 4 is migrated to schema 5 on first open
 after writing a `state.db.v4-<UTC timestamp>.bak` backup. A schema 5 database is not
@@ -127,13 +146,13 @@ configured repository into a temporary directory and uses disposable state.
 ## Upgrade from 2.4.3
 
 1. Stop authority commands and back up SQLite state in an SQLite-aware way.
-2. Install the 2.4.5 runtime.
+2. Install the current runtime.
 3. The first command migrates schema 4 to schema 5 and writes a v4 backup. Keep it
    until the new state is proven; it is the downgrade path.
 4. Remove the old optional keys from the private registration: `agenthub_version`,
    `project_name`, `workflow`, `messaging_transports`, `lark_workflow`,
    `execution.concurrency`, `execution.isolation`, and the task-naming catalogue
-   keys. They are ignored by 2.4.5 but should not be carried forward.
+   keys. See the [registration guide](docs/PROJECT_REGISTRATION.md) for current keys.
 5. Update role instructions that still mention `init` or `claim-next`.
 6. Run the audit, tests and isolated smoke check before resuming work.
 

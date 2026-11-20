@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AgentHub v2.4.5: a small, decision-first multi-agent control plane.
+"""AgentHub: a small, decision-first multi-agent control plane.
 
 The canonical runtime and SQLite state live on the project execution host.
 Other devices are thin clients and proxy commands through SSH.
@@ -42,7 +42,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-VERSION = "2.4.5"
+VERSION = "2.4.6"
 SCHEMA_VERSION = 5
 CONFIG_SCHEMA = 1
 MAX_CONTRACT_BYTES = 16_384
@@ -435,13 +435,19 @@ def proxy_to_authority(config: dict[str, Any], device: str, argv: list[str], ses
     return subprocess.run(ssh_command, check=False).returncode
 
 
-def connect(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30)
+def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
+    if read_only:
+        if not path.is_file():
+            raise HubError("state.migration", "预检需要已初始化的状态库；请先用 decision 记录决策")
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    if not read_only:
+        conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -1783,21 +1789,26 @@ def do_show(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device
     }
 
 
-def do_post(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, raw: str) -> dict[str, Any]:
+def do_post(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, raw: str,
+            *, dry_run: bool = False) -> dict[str, Any]:
     identity(config, agent, device, "post")
     spec = validate_task_contract(config, raw)
-    acknowledgements: list[dict[str, Any]] = []
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        acknowledgements = insert_task(conn, config, agent, spec, now())
-        detail = {key: spec[key] for key in ("title", "priority", "assignee", "decision_key", "base_commit")}
-        if acknowledgements:
-            detail["path_overlap_ack"] = acknowledgements
-        record(conn, agent, device, "task.post", spec["id"], detail)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+    if dry_run:
+        acknowledgements = check_task_constraints(conn, config, spec)
+        result = {"id": spec["id"], "dry_run": True}
+    else:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            acknowledgements = insert_task(conn, config, agent, spec, now())
+            detail = {key: spec[key] for key in ("title", "priority", "assignee", "decision_key", "base_commit")}
+            if acknowledgements:
+                detail["path_overlap_ack"] = acknowledgements
+            record(conn, agent, device, "task.post", spec["id"], detail)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        result = {"id": spec["id"], "status": "ready"}
     warnings = []
     if acknowledgements:
         warnings.append({
@@ -1805,7 +1816,7 @@ def do_post(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device
             "message": "allowed_paths 与其他活动任务重叠，已按 allow_path_overlap 放行",
             "acknowledgements": acknowledgements,
         })
-    return {"id": spec["id"], "status": "ready", "warnings": warnings}
+    return result | {"warnings": warnings}
 
 
 def claim_task(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, row: sqlite3.Row,
@@ -1926,6 +1937,8 @@ def do_release(conn: sqlite3.Connection, config: dict[str, Any], agent: str, dev
                 raise HubError("task.state", f"任务租约尚未过期（剩余 {lease['remaining_seconds']} 秒）；拒绝按过期释放")
         if not forced:
             require_session(config, row, session, "release")
+            if row["active_device"] != device:
+                raise HubError("task.state", f"任务活动设备是 {row['active_device']}；请在该设备释放任务")
         clear_claim(conn, task_id, "ready", now())
         record(conn, agent, device, "task.release", task_id, {
             "executor": row["claimed_by"], "previous_status": row["status"],
@@ -1992,7 +2005,8 @@ def do_handoff(conn: sqlite3.Connection, config: dict[str, Any], agent: str, dev
     except Exception:
         conn.rollback()
         raise
-    return {"task_id": task_id, "from_device": row["active_device"], "to_device": to_device}
+    return {"task_id": task_id, "from_device": row["active_device"], "to_device": to_device,
+            "session": row["claim_session"]}
 
 
 def do_checkpoint(conn: sqlite3.Connection, config: dict[str, Any], agent: str, device: str, task_id: str,
@@ -2525,8 +2539,11 @@ def _task_text(task: dict[str, Any] | None) -> str:
         lines.append("  allowed: " + ", ".join(str(item) for item in contract["allowed_paths"]))
     if task.get("active_device"):
         lines.append(f"  device: {task['active_device']} session={task.get('claim_session') or '-'}")
-    if task.get("checkpoint"):
-        lines.append(f"  checkpoint: {task['checkpoint'].get('summary', '')}")
+    if task.get("worktree_path"):
+        lines.append(f"  worktree: {task['worktree_path']}")
+    if checkpoint := task.get("checkpoint"):
+        lines.append(f"  checkpoint: {checkpoint['summary']}")
+        lines.append(f"  next step: {checkpoint['next_step']}")
     return "\n".join(lines)
 
 
@@ -2538,9 +2555,12 @@ def render_text(command: str, data: dict[str, Any]) -> str:
             deps = f" deps={','.join(task['depends_on'])}" if task.get("depends_on") else ""
             unmet = task.get("dependency", {}).get("unmet", [])
             blocked = f" blocked_by={','.join(item['task_id'] for item in unmet)}" if unmet else ""
+            ownership = ""
+            if task["status"] == "in_progress":
+                ownership = f" device={task['active_device'] or '-'} session={task['claim_session'] or '-'}"
             lines.append(
                 f"- [{task['status']}] {task['id']} {task['title']} (P{task['priority']})"
-                f"{chain}{deps}{blocked} -> {task.get('claimed_by') or '未认领'}"
+                f"{chain}{deps}{blocked} -> {task.get('claimed_by') or '未认领'}{ownership}"
             )
         return "\n".join(lines)
     if command == "context":
@@ -2580,13 +2600,15 @@ def render_text(command: str, data: dict[str, Any]) -> str:
             lines.append(f"- #{item['submission_id']} {item['outcome']} by {item['agent']} at {item['created_at']}")
         return "\n".join(lines)
     if command == "post":
-        lines = [f"已发布 {data['id']}"]
+        action = "预检通过" if data.get("dry_run") else "已发布"
+        lines = [f"{action} {data['id']}"]
         lines.extend(f"warning: {item['message']}" for item in data.get("warnings", []))
         return "\n".join(lines)
     if command == "release":
         return f"已释放 {data['task_id']} -> ready"
     if command == "handoff":
-        return f"已交接 {data['task_id']}: {data['from_device']} -> {data['to_device']}"
+        return (f"已交接 {data['task_id']}: {data['from_device']} -> {data['to_device']} "
+                f"session={data['session'] or '-'}")
     if command == "checkpoint":
         return f"已保存 checkpoint {data['task_id']} generation={data['generation']}"
     if command == "heartbeat":
@@ -2679,6 +2701,7 @@ def parser() -> argparse.ArgumentParser:
     post = subs.add_parser("post")
     post.add_argument("agent")
     post.add_argument("--spec", required=True)
+    post.add_argument("--dry-run", action="store_true", help="validate the contract without publishing it")
     claim = subs.add_parser("claim")
     claim.add_argument("agent")
     claim.add_argument("task_id", nargs="?")
@@ -2776,7 +2799,7 @@ def dispatch(conn: sqlite3.Connection, config: dict[str, Any], args: argparse.Na
     if args.command == "show":
         return do_show(conn, config, args.agent, device, args.task_id, session, args.submissions)
     if args.command == "post":
-        return do_post(conn, config, args.agent, device, args.spec)
+        return do_post(conn, config, args.agent, device, args.spec, dry_run=args.dry_run)
     if args.command == "claim":
         return do_claim(conn, config, args.agent, device, args.task_id, session, args.lease_minutes)
     if args.command == "release":
@@ -2838,9 +2861,17 @@ def run(argv: list[str] | None = None) -> int:
     if not args.local and device != config["state_authority"]["host"] and config.get("remote", {}).get("enabled"):
         return proxy_to_authority(config, device, argv, session, bool(args.text))
     state = Path(args.state or config["state_authority"]["database"])
-    conn = connect(state)
+    dry_run = args.command == "post" and args.dry_run
+    conn = connect(state, read_only=dry_run)
     try:
-        migration = prepare_database(conn, state)
+        migration = None
+        if dry_run:
+            conn.execute("BEGIN")
+            version = _read_schema_version(conn)
+            if version != SCHEMA_VERSION:
+                raise HubError("state.migration", f"预检需要 schema {SCHEMA_VERSION}；请先正常运行 status 初始化或升级状态库")
+        else:
+            migration = prepare_database(conn, state)
         data = dispatch(conn, config, args, device, session)
         if migration is not None:
             data = data | {"migration": migration}

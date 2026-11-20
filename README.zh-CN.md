@@ -32,6 +32,17 @@ AgentHub core：生命周期、角色权限、合同校验、SQLite 状态
 
 ## 快速开始
 
+从 [GitHub Releases](https://github.com/HuangXin-erniu/agenthub-core/releases) 选择指定版本的 wheel。
+可以用本地文件路径或发布资产链接安装。更新时，用新版本的 wheel 再运行同一条命令。
+
+```sh
+uv tool install "<wheel 文件路径或发布资产链接>"
+agenthub --version
+agenthub --config "<私有 project.json 路径>" --device <device_id> context <decider_agent_id>
+```
+
+从源码检出运行时，使用 `python agent_hub.py`：
+
 ```sh
 python agent_hub.py --project <project_id> --device <device_id> context <decider_agent_id>
 python agent_hub.py --project <project_id> --device <device_id> next <executor_agent_id>
@@ -53,8 +64,8 @@ python agent_hub.py --project <project_id> --device <device_id> --session <windo
 | `submit`、`review`、`close` | 提交证据、复核并集成 |
 | `cancel`、`supersede`、`prune` | 保留取消/替代历史并回收 worktree |
 
-`claim <agent> [task_id]` 领取指定任务；省略 task_id 时领取下一个可用任务。2.4.5 已
-删除 `init` 和 `claim-next`；每个命令都会打开或迁移状态库，不需要单独初始化。
+`claim <agent> [task_id]` 领取指定任务，省略 task_id 时领取下一个可用任务。普通命令会
+打开或迁移状态库。`post --dry-run` 只读已初始化的 schema 5 状态库。
 
 所有命令输出统一 JSON envelope（`{"ok": true, "data": ...}`）；领域错误在 stderr 输出
 `{"ok": false, "error": {"code": ...}}`。`--text` 输出人类可读摘要。详见
@@ -69,6 +80,7 @@ python agent_hub.py --project <project_id> --device <device_id> --session <windo
 ```sh
 # 决策与合同
 python agent_hub.py ... decision <admin> --key D-1 --summary "..." --rationale "..."
+python agent_hub.py ... post <admin> --spec @task.json --dry-run
 python agent_hub.py ... post <admin> --spec @task.json
 
 # 执行
@@ -95,6 +107,10 @@ python agent_hub.py ... close <admin> TASK-001 --merge-commit <sha> --target-bra
 同一身份的其他窗口。`execution.session_policy: required` 下，认领必须带 session；旧
 的未绑定认领需先用 `--session <id> heartbeat <executor> <task_id>` 绑定一次。租约只做提示，过期不会自动释放。
 
+确认旧窗口已停止后，用 `--text status <executor> --mine` 查询原 session 和活动设备，再用
+`--device <device> --session <id> --text show <executor> <task_id>` 查看工作区和 checkpoint 中的下一步。
+换设备时，在活动设备执行 `checkpoint` 后执行 `handoff`。接收窗口使用返回的 `to_device` 续做，已绑定会话的任务还需传入返回的 `session`。
+
 权威主机拥有 SQLite 状态和 worktree；不要放在同步目录中，并单独备份状态。首次打开
 schema 4 状态时会先写 `state.db.v4-<UTC 时间戳>.bak`，再原地迁移到 schema 5。
 2.4.3 不能直接读 schema 5；回滚需恢复该备份。
@@ -114,12 +130,12 @@ smoke 脚本会克隆配置仓库到临时目录，并使用一次性状态。
 ## 从 2.4.3 升级
 
 1. 停止权威主机命令，用 SQLite 感知方式备份状态。
-2. 安装 2.4.5 运行时。
+2. 安装当前运行时。
 3. 首次命令会把 schema 4 迁移到 5，并生成 v4 备份；在新状态验证完成前保留该备份，
    它是唯一的降级路径。
 4. 从私有注册中删除旧可选键：`agenthub_version`、`project_name`、`workflow`、
    `messaging_transports`、`lark_workflow`、`execution.concurrency`、
-   `execution.isolation` 以及命名目录子键。2.4.5 会忽略它们，但不应继续保留。
+   `execution.isolation` 以及命名目录子键。当前配置项见[项目注册指南](docs/PROJECT_REGISTRATION.md)。
 5. 更新仍提到 `init` 或 `claim-next` 的角色说明。
 6. 恢复工作前运行审计、测试和隔离 smoke。
 

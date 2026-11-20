@@ -15,6 +15,7 @@
   "docs/PROJECT_REGISTRATION.md",
   "docs/SPEC.md",
   "projects/README.md",
+  "pyproject.toml",
   "release-files.json",
   "scripts/audit_agenthub.py",
   "scripts/check_release.py",

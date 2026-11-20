@@ -16,6 +16,16 @@ class MigrationTests(HubFixture):
     def prepare_v4(self) -> None:
         create_v4_database(self.state, self.base_commit, self.worktrees)
 
+    def test_post_dry_run_does_not_migrate_legacy_state(self):
+        self.prepare_v4()
+        original = self.state.read_bytes()
+        error = self.call_error("--device", "client_primary", "post", "admin_agent",
+                                "--spec", json.dumps(self.packet()), "--dry-run")
+        self.assertEqual(error.code, "state.migration")
+        self.assertIn("status", error.message)
+        self.assertEqual(self.state.read_bytes(), original)
+        self.assertFalse(list(self.root.glob("state.db.v4-*.bak")))
+
     def test_v4_migrates_with_backup_and_preserves_rows(self):
         self.prepare_v4()
         data = self.call("--device", "client_primary", "status", "admin_agent")

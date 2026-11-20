@@ -4,11 +4,16 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from zipfile import ZipFile
+
+from support import HubFixture
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -181,6 +186,57 @@ class PublicationTests(unittest.TestCase):
                 self.assertNotIn("ghp_" + "B" * 36, output.getvalue())
             finally:
                 release.ROOT = old_root
+
+
+@unittest.skipUnless(os.environ.get("AGENTHUB_TEST_WHEEL_DIR"), "requires a built wheel")
+class WheelTests(HubFixture):
+    def test_wheel_installs_and_upgrades_outside_the_checkout(self):
+        wheel_dir = Path(os.environ["AGENTHUB_TEST_WHEEL_DIR"]).resolve()
+        wheel = wheel_dir / f"agenthub_core-{hub.VERSION}-py3-none-any.whl"
+        metadata_dir = f"agenthub_core-{hub.VERSION}.dist-info/"
+        with ZipFile(wheel) as archive:
+            self.assertEqual(set(archive.namelist()), {"agent_hub.py"} | {
+                metadata_dir + name for name in ("METADATA", "WHEEL", "entry_points.txt",
+                                                  "top_level.txt", "RECORD", "licenses/LICENSE")
+            })
+
+        self.decide()
+        config_before = self.config.read_bytes()
+        state_before = self.state.read_bytes()
+        environment = self.root / "installed"
+        scripts = environment / ("Scripts" if os.name == "nt" else "bin")
+        python = scripts / ("python.exe" if os.name == "nt" else "python")
+        agenthub = scripts / ("agenthub.exe" if os.name == "nt" else "agenthub")
+
+        def run(*command):
+            result = subprocess.run(command, cwd=self.root, capture_output=True,
+                                    text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result.stdout
+
+        # The prior release predates wheel distribution. Package its actual runtime as a test fixture.
+        previous_source = self.root / "previous-source"
+        previous_source.mkdir()
+        for name in ("pyproject.toml", "README.md", "LICENSE"):
+            shutil.copyfile(ROOT / name, previous_source / name)
+        (previous_source / "agent_hub.py").write_bytes(release.git(ROOT, "show", "v2.4.5:agent_hub.py"))
+        previous_dist = self.root / "previous-dist"
+        run(sys.executable, "-m", "build", "--wheel", "--outdir", str(previous_dist), str(previous_source))
+        previous_wheel = previous_dist / "agenthub_core-2.4.5-py3-none-any.whl"
+
+        run(sys.executable, "-m", "venv", str(environment))
+        install = (str(python), "-m", "pip", "install", "--no-index", "--no-deps")
+        run(*install, str(previous_wheel))
+        self.assertEqual(run(str(agenthub), "--version").strip(), "AgentHub 2.4.5")
+        run(*install, "--upgrade", str(wheel))
+        self.assertEqual(run(str(agenthub), "--version").strip(), f"AgentHub {hub.VERSION}")
+        self.assertEqual(self.config.read_bytes(), config_before)
+        self.assertEqual(self.state.read_bytes(), state_before)
+        status = json.loads(run(str(agenthub), "--config", str(self.config), "--device", "authority",
+                                "status", "worker_a"))
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["data"]["project"], "test")
+        self.assertEqual(status["data"]["version"], hub.VERSION)
 
 
 if __name__ == "__main__":
